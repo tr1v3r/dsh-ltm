@@ -83,6 +83,11 @@ describe("cli", () => {
     expect(stdout()).toContain("usage:");
   });
 
+  it("--help after a subcommand also exits 0", async () => {
+    expect(await runCli(["--db", db(), "list", "--help"])).toBe(0);
+    expect(stdout()).toContain("usage:");
+  });
+
   it("write-then-search-list-show-edit-tag-pin-confirm lifecycle", async () => {
     expect(
       await runCli(["--db", db(), "search", "nothing", "--json"]),

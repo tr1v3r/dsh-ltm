@@ -145,6 +145,8 @@ function parseArgv(argv: readonly string[]): ParsedArgs {
         if (!allowedValues.has(flag)) fail(`${parsed.command}: unknown flag --${flag}`);
       }
       for (const flag of parsed.boolFlags) {
+        // `--help` is accepted on every command; runCli prints usage and exits 0.
+        if (flag === "help") continue;
         if (!allowedBools.has(flag)) fail(`${parsed.command}: unknown flag --${flag}`);
       }
       if (parsed.positionals.length < spec.min) fail(`${parsed.command}: missing argument`);
