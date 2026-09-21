@@ -28,7 +28,9 @@ jobs:
         run: |
           node bin/dsh-ltm.mjs --help
           T="$(mktemp -d)"
-          printf '{"format":"dsh-ltm-export/1","records":[{"text":"CI smoke 记忆","tags":["ci"]}]}' > "$T/in.json"
+          # `import` validates strictly and only accepts records shaped like
+          # `export` output, so the smoke fixture carries every field.
+          printf '{"format":"dsh-ltm-export/1","records":[{"id":1,"text":"CI smoke 记忆","tags":"ci","scope":"","pinned":false,"createdAt":1,"updatedAt":1,"lastConfirmedAt":1}]}' > "$T/in.json"
           node bin/dsh-ltm.mjs --db "$T/ltm.db" import "$T/in.json" | grep -q 'imported 1'
           node bin/dsh-ltm.mjs --db "$T/ltm.db" search "记忆" | grep -q 'CI smoke'
 

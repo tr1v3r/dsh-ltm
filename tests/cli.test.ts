@@ -83,6 +83,11 @@ describe("cli", () => {
     expect(stdout()).toContain("usage:");
   });
 
+  it("--help after a subcommand also exits 0", async () => {
+    expect(await runCli(["--db", db(), "list", "--help"])).toBe(0);
+    expect(stdout()).toContain("usage:");
+  });
+
   it("write-then-search-list-show-edit-tag-pin-confirm lifecycle", async () => {
     expect(
       await runCli(["--db", db(), "search", "nothing", "--json"]),
@@ -117,16 +122,39 @@ describe("cli", () => {
     expect(JSON.parse(stdout()).confirmed).toBe(1);
   });
 
-  it("export/import round-trips", async () => {
-    legacyFixture();
+  it("export/import preserves complete record state and id conflict semantics", async () => {
     const newDb = join(dir, "roundtrip.db");
-    expect(await runCli(["--db", newDb, "migrate", join(dir, "memory.db")])).toBe(0);
+    const source = new MemoryStore(newDb, { now: () => 1_000 });
+    const original = source.write("round trip", ["Mixed", "tag"], { scope: "work", pinned: true }).record;
+    source.confirm(original.id);
+    source.close();
     const outFile = join(dir, "export.json");
     expect(await runCli(["--db", newDb, "export", "--out", outFile])).toBe(0);
     const imported = join(dir, "imported.db");
     resetOut();
     expect(await runCli(["--db", imported, "import", outFile, "--json"])).toBe(0);
-    expect(JSON.parse(stdout()).imported).toBe(3);
+    expect(JSON.parse(stdout())).toEqual({ imported: 1, skipped: 0 });
+    const restored = new MemoryStore(imported);
+    expect(restored.list()[0]).toEqual(original);
+    restored.close();
+    resetOut();
+    expect(await runCli(["--db", imported, "import", outFile, "--json"])).toBe(0);
+    expect(JSON.parse(stdout())).toEqual({ imported: 0, skipped: 1 });
+    const payload = JSON.parse(readFileSync(outFile, "utf8"));
+    payload.records[0].text = "conflicting text";
+    writeFileSync(outFile, JSON.stringify(payload));
+    expect(await runCli(["--db", imported, "import", outFile])).toBe(1);
+    const unchanged = new MemoryStore(imported);
+    expect(unchanged.list()[0]).toEqual(original);
+    unchanged.close();
+  });
+
+  it("rejects malformed and unsupported import payloads", async () => {
+    const file = join(dir, "bad.json");
+    writeFileSync(file, JSON.stringify({ format: "other", records: [] }));
+    expect(await runCli(["--db", db(), "import", file])).toBe(1);
+    writeFileSync(file, JSON.stringify({ format: "dsh-ltm-export/1", records: [{ id: 1, text: "x", tags: ["bad"] }] }));
+    expect(await runCli(["--db", db(), "import", file])).toBe(1);
   });
 
   it("migrate copies the fixture, leaves the source untouched", async () => {
@@ -146,6 +174,20 @@ describe("cli", () => {
     expect(stdout()).toContain("legacy preference: use pnpm");
     expect(await runCli(["--db", db(), "search", "跨会话"])).toBe(0);
     expect(stdout()).toContain("旧的中文记忆");
+  });
+
+  it("rejects unknown, mutually exclusive, and surplus arguments", async () => {
+    expect(await runCli(["--db", db(), "list", "--wat"])).toBe(1);
+    expect(errChunks.join("")).toContain("unknown flag --wat");
+    resetOut();
+    expect(await runCli(["--db", db(), "list", "--stale", "--fresh"])).toBe(1);
+    expect(errChunks.join("")).toContain("mutually exclusive");
+    resetOut();
+    expect(await runCli(["--db", db(), "show", "1", "extra"])).toBe(1);
+    expect(errChunks.join("")).toContain("unexpected argument");
+    resetOut();
+    expect(await runCli(["--db", db(), "confirm", "1", "--all"])).toBe(1);
+    expect(errChunks.join("")).toContain("mutually exclusive");
   });
 
   it("fails loudly on bad commands and bad config", async () => {

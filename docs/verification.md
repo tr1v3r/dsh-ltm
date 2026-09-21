@@ -7,8 +7,10 @@
 | 检查 | 命令 | 结果 |
 |---|---|---|
 | 全仓类型检查 | `pnpm typecheck` | ✅ 0 错（t1 报的 surface 残留错误已由 t2 收敛） |
-| 全部单测 | `pnpm test`（vitest run） | ✅ 9 文件 / 68 用例全绿 |
+| 全部单测 | `pnpm test`（vitest run） | ✅ 10 文件 / 96 用例全绿 |
 | 构建 | `pnpm build` | ✅ dist 5 文件，含 bin 所需 `dist/cli.js` |
+| Schema 安全回归 | `tests/store.test.ts` | ✅ 未来版/脏值/无迁移旧版均在 PRAGMA/DDL 前拒绝，sha256 不变 |
+| WAL 快照回归 | `tests/migrate.test.ts` | ✅ 活动 writer + 未 checkpoint WAL 的已提交行进入一致快照，源 db/WAL sha256 不变 |
 | 真实 boot 探针 | `node probe/boot-probe.mjs` | ✅ 18/18 断言通过，exit 0 |
 
 ## 2. 真实 boot 探针（非 `--dump-config`）
