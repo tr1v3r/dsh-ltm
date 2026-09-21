@@ -75,8 +75,11 @@ function legacyFixture(pinOne = false): string {
 }
 
 describe("cli", () => {
-  it("usage/help exits 0", async () => {
+  it("help subcommand and --help both exit 0", async () => {
     expect(await runCli(["help"])).toBe(0);
+    expect(stdout()).toContain("usage:");
+    resetOut();
+    expect(await runCli(["--help"])).toBe(0);
     expect(stdout()).toContain("usage:");
   });
 

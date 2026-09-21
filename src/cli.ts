@@ -192,9 +192,10 @@ export async function runCli(argv: readonly string[]): Promise<number> {
   try {
     const parsed = parseArgv(argv);
     const { command, positionals, flags, boolFlags, json } = parsed;
-    if (command === undefined || command === "help") {
+    const helpRequested = command === "help" || boolFlags.has("help");
+    if (command === undefined || helpRequested) {
       out(json, { usage: USAGE }, USAGE);
-      return command === undefined ? 1 : 0;
+      return helpRequested ? 0 : 1;
     }
 
     const config = loadConfig({
