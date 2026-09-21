@@ -109,6 +109,11 @@ export function validateConfig(config: LtmConfig): void {
       );
     }
   }
+  if (!Number.isFinite(config.promptOrder)) {
+    throw new Error(
+      `ltm: invalid promptOrder ${config.promptOrder} — must be finite`,
+    );
+  }
   for (const field of THRESHOLD_FIELDS) {
     const value = config[field];
     if (!Number.isFinite(value) || value < 0 || value > 1) {
