@@ -58,14 +58,14 @@ function publicHit(hit: DedupeHit) {
  * @returns the {@link ToolSet} implementation.
  */
 export function createToolSet(store: MemoryStore, config: Config): ToolSet {
-  function requireText(text: string): string {
+  function requireText(text: string, op = "memory_write"): string {
     const trimmed = text.trim();
     if (trimmed.length === 0) {
-      throw new Error("memory_write: `text` must not be blank");
+      throw new Error(`${op}: \`text\` must not be blank`);
     }
     if (trimmed.length > config.maxTextChars) {
       throw new Error(
-        `memory_write: \`text\` is ${trimmed.length} chars, over the ${config.maxTextChars} limit`,
+        `${op}: \`text\` is ${trimmed.length} chars, over the ${config.maxTextChars} limit`,
       );
     }
     return trimmed;
@@ -114,7 +114,7 @@ export function createToolSet(store: MemoryStore, config: Config): ToolSet {
         tags?: readonly string[];
         pinned?: boolean;
       } = {};
-      if (args.text !== undefined) patch.text = requireText(args.text);
+      if (args.text !== undefined) patch.text = requireText(args.text, "memory_update");
       if (args.tags !== undefined) patch.tags = normalizeTagsList(args.tags);
       if (args.pinned !== undefined) patch.pinned = args.pinned;
       const record = store.update(args.id, patch);
@@ -161,6 +161,37 @@ function normalizeTagsList(tags: readonly string[]): string[] {
 }
 
 /**
+ * JSON Schema of the full public record projection ({@link publicRecord}).
+ * Shared by every tool that returns records so the registered output schema
+ * always matches the fields actually serialized (previously `memory_search`
+ * and `memory_list` declared only 4 of the 9 fields their execute() returned).
+ */
+export const memoryRecordOutputSchema = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    id: { type: "integer", required: true },
+    text: { type: "string", required: true },
+    tags: { type: "string", required: true },
+    scope: { type: "string", required: true },
+    pinned: { type: "boolean", required: true },
+    createdAt: { type: "integer", required: true },
+    updatedAt: { type: "integer", required: true },
+    lastConfirmedAt: { type: "integer", required: true },
+  },
+} satisfies ObjectValueSchemaSpec;
+
+/** JSON Schema of a search hit: the full record plus its relevance score. */
+export const memorySearchResultOutputSchema = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    ...memoryRecordOutputSchema.properties,
+    score: { type: "number", required: true },
+  },
+} satisfies ObjectValueSchemaSpec;
+
+/**
  * JSON Schema of `memory_write`'s execute() return value (the shape
  * {@link serializers.write} produces). Declared here so tests can validate
  * actual outputs against the exact schema the Cordis layer registers.
@@ -170,20 +201,7 @@ export const memoryWriteOutputSchema = {
   additionalProperties: false,
   properties: {
     written: { type: "boolean", required: true },
-    record: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        id: { type: "integer", required: true },
-        text: { type: "string", required: true },
-        tags: { type: "string", required: true },
-        scope: { type: "string", required: true },
-        pinned: { type: "boolean", required: true },
-        createdAt: { type: "integer", required: true },
-        updatedAt: { type: "integer", required: true },
-        lastConfirmedAt: { type: "integer", required: true },
-      },
-    },
+    record: memoryRecordOutputSchema,
     dedupeHits: {
       type: "array",
       items: {

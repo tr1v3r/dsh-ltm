@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   createToolSet,
+  memoryRecordOutputSchema,
+  memorySearchResultOutputSchema,
   memoryWriteOutputSchema,
   serializers,
 } from "../src/tools.js";
@@ -152,5 +154,72 @@ describe("memory_write output schema (F2)", () => {
     expect(() =>
       validateJsonSchemaValue(schema, blocked),
     ).not.toThrow();
+  });
+});
+
+describe("search / list output schemas (regression: M-6)", () => {
+  it("serializers.search output validates against the full search-result schema", async () => {
+    const { validateJsonSchemaValue, valueSchemaSpecToJsonSchema } = await import(
+      "@deepseek-ai/dsh-tools",
+    );
+    const schema = valueSchemaSpecToJsonSchema({
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        results: { type: "array", required: true, items: memorySearchResultOutputSchema },
+      },
+    });
+    const tools = createToolSet(store, config);
+    tools.memory_write({ text: "schema search alpha", tags: ["s"] });
+    const value = serializers.search(tools.memory_search({ query: "alpha" }));
+    // Previously the registered schema declared only 4 of the 9 serialized
+    // fields; the serializer emits scope/createdAt/updatedAt/lastConfirmedAt/score.
+    expect(() => validateJsonSchemaValue(schema, value)).not.toThrow();
+    expect(value.results[0]).toHaveProperty("lastConfirmedAt");
+    expect(value.results[0]).toHaveProperty("score");
+  });
+
+  it("serializers.record output validates against the full record schema", async () => {
+    const { validateJsonSchemaValue, valueSchemaSpecToJsonSchema } = await import(
+      "@deepseek-ai/dsh-tools",
+    );
+    const schema = valueSchemaSpecToJsonSchema({
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        records: { type: "array", required: true, items: memoryRecordOutputSchema },
+      },
+    });
+    const tools = createToolSet(store, config);
+    tools.memory_write({ text: "schema list beta", tags: ["l"] });
+    const value = {
+      records: tools.memory_list({}).records.map((r) => serializers.record(r)!),
+    };
+    expect(() => validateJsonSchemaValue(schema, value)).not.toThrow();
+    expect(value.records[0]).toHaveProperty("lastConfirmedAt");
+  });
+
+  it("search hits carry the real lastConfirmedAt, not a stale 0 (regression: M-2)", () => {
+    const tools = createToolSet(store, config);
+    const { record } = tools.memory_write({ text: "freshness fact", tags: ["m"] });
+    const hit = serializers.search(tools.memory_search({ query: "freshness" }))
+      .results[0]!;
+    // The render path used to inject lastConfirmedAt: 0, which is older than any
+    // stale horizon, so every recalled memory rendered as "stale".
+    expect(hit.lastConfirmedAt).toBeGreaterThan(0);
+    expect(hit.lastConfirmedAt).toBe(record.lastConfirmedAt);
+  });
+});
+
+describe("error message attribution (regression: L-10)", () => {
+  it("memory_update reports its own name, not memory_write, on bad text", () => {
+    const tools = createToolSet(store, config);
+    const { record } = tools.memory_write({ text: "editable fact" });
+    expect(() => tools.memory_update({ id: record.id, text: "   " })).toThrow(
+      /^memory_update:/,
+    );
+    expect(() =>
+      tools.memory_update({ id: record.id, text: "x".repeat(config.maxTextChars + 1) }),
+    ).toThrow(/^memory_update:/);
   });
 });

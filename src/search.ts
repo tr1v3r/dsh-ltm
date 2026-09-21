@@ -80,15 +80,26 @@ export const BM25_WEIGHT = 0.6;
 
 /**
  * Blend FTS5 BM25 ranks and char n-gram cosine into one descending score
- * (contracts' {@link Reranker}). BM25 is normalized as `1 − rank/max(rank)`
- * (lower rank = better). With a single candidate the normalized BM25 term is 1.
+ * (contracts' {@link Reranker}).
+ *
+ * SQLite FTS5's `rank` column is *lower-is-better* and, with the default bm25
+ * weighting, is normally **negative** (the best match is the most negative).
+ * The previous `1 − rank/max(rank)` formula silently broke on that sign: with
+ * every rank negative the `max(rank) > 0` guard never fired, so every hit got
+ * the constant fallback `1` and the BM25 term dropped out of the blend entirely
+ * (ranking collapsed to pure cosine). Min-max the ranks instead — mapping the
+ * best (most negative) rank to 1 and the worst to 0 — which is sign-agnostic.
+ * A single candidate, or a set with no rank spread, has nothing to separate and
+ * receives the neutral value 1.
  */
 export function rerankResults(query: string, hits: SearchResult[]): SearchResult[] {
   if (hits.length === 0) return hits;
-  const maxRank = Math.max(...hits.map((h) => h.ftsRank));
+  const ranks = hits.map((h) => h.ftsRank);
+  const bestRank = Math.min(...ranks); // lower is better
+  const worstRank = Math.max(...ranks);
+  const spread = worstRank - bestRank;
   const out = hits.map((hit) => {
-    // A single candidate has no rank spread; treat it as fully BM25-relevant.
-    const bm25norm = hits.length === 1 ? 1 : maxRank > 0 ? 1 - hit.ftsRank / maxRank : 1;
+    const bm25norm = spread === 0 ? 1 : (worstRank - hit.ftsRank) / spread;
     const cos = ngramCosine(query, hit.text);
     return { ...hit, score: BM25_WEIGHT * bm25norm + (1 - BM25_WEIGHT) * cos };
   });

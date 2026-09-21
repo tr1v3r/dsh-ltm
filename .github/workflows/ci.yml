@@ -48,7 +48,13 @@ jobs:
       - name: Pack and assert contents
         run: |
           pnpm pack --pack-destination .
-          tar tzf dsh-ltm-*.tgz | sed 's|^package/||' | grep -v '^$' | sort > packed.txt
+          shopt -s nullglob
+          tarballs=(*dsh-ltm-*.tgz)
+          if [ "${#tarballs[@]}" -ne 1 ]; then
+            printf 'expected exactly one dsh-ltm tarball, got %s\n' "${#tarballs[@]}" >&2
+            exit 1
+          fi
+          tar tzf "${tarballs[0]}" | sed 's|^package/||' | grep -v '^$' | sort > packed.txt
           printf '%s\n' LICENSE README.md bin/dsh-ltm.mjs cordis.patch.yml \
             dist/cli.d.ts dist/cli.js dist/index.d.ts dist/index.js \
             dist/prompt-DmwR6shM.js package.json | sort > expected.txt
@@ -62,4 +68,4 @@ jobs:
           echo "packed contents OK: $(wc -l < packed.txt) files"
       - name: Clean up pack artifacts
         if: always()
-        run: rm -f dsh-ltm-*.tgz packed.txt packed-core.txt expected.txt expected-core.txt
+        run: rm -f *dsh-ltm-*.tgz packed.txt packed-core.txt expected.txt expected-core.txt
