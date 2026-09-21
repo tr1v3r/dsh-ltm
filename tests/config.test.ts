@@ -89,6 +89,15 @@ describe("loadConfig", () => {
     );
   });
 
+  it("throws on a non-finite promptOrder", () => {
+    expect(() => loadConfig({ path: "x", promptOrder: Number.NaN })).toThrow(
+      /promptOrder/,
+    );
+    expect(() =>
+      loadConfig({ path: "x", promptOrder: Number.POSITIVE_INFINITY }),
+    ).toThrow(/promptOrder/);
+  });
+
   it("throws when searchLimitDefault exceeds the cap", () => {
     expect(() =>
       loadConfig({ path: "x", searchLimitDefault: 10, searchLimitMax: 5 }),
