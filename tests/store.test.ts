@@ -1,14 +1,16 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+
 import { afterEach, describe, expect, it } from "vitest";
 
 import { BM25_WEIGHT, ngramCosine } from "../src/search.js";
 import { MemoryStore } from "../src/store.js";
 
 const stores: MemoryStore[] = [];
-const tempDirs: string[] = [];
+const dirs: string[] = [];
 function open(options?: ConstructorParameters<typeof MemoryStore>[1]): MemoryStore {
   const store = new MemoryStore(":memory:", options);
   stores.push(store);
@@ -16,8 +18,23 @@ function open(options?: ConstructorParameters<typeof MemoryStore>[1]): MemorySto
 }
 afterEach(() => {
   for (const store of stores.splice(0)) store.close();
-  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
+
+function sha256(path: string): string {
+  return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+function versionedDb(value: string): string {
+  const dir = mkdtempSync(join(tmpdir(), "dsh-ltm-schema-"));
+  dirs.push(dir);
+  const path = join(dir, "ltm.db");
+  const db = new DatabaseSync(path);
+  db.exec("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  db.prepare("INSERT INTO meta (key, value) VALUES ('schema_version', ?)").run(value);
+  db.close();
+  return path;
+}
 
 describe("MemoryStore basics", () => {
   it("write/count/forget keep base rows and FTS rows in sync", () => {
@@ -42,6 +59,36 @@ describe("MemoryStore basics", () => {
     const store = open({ maxTextChars: 10 });
     expect(() => store.write("   ", [])).toThrow(/blank/);
     expect(() => store.write("x".repeat(11), [])).toThrow(/limit/);
+  });
+
+  it("rejects a future schema before PRAGMA or DDL can change its bytes", () => {
+    const path = versionedDb("2");
+    const before = sha256(path);
+    expect(() => new MemoryStore(path)).toThrow(/newer than supported 1/);
+    expect(sha256(path)).toBe(before);
+
+    const db = new DatabaseSync(path, { readOnly: true });
+    expect(
+      db.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name").all(),
+    ).toEqual([{ name: "meta" }]);
+    db.close();
+  });
+
+  it.each(["1junk", "01", "+1", "1.0", " 1", "9007199254740992"])(
+    "rejects non-canonical schema_version %j without modifying the database",
+    (version) => {
+      const path = versionedDb(version);
+      const before = sha256(path);
+      expect(() => new MemoryStore(path)).toThrow(/invalid database schema version/);
+      expect(sha256(path)).toBe(before);
+    },
+  );
+
+  it("fails closed for an unsupported older schema", () => {
+    const path = versionedDb("0");
+    const before = sha256(path);
+    expect(() => new MemoryStore(path)).toThrow(/older than supported 1.*no migration path/);
+    expect(sha256(path)).toBe(before);
   });
 
   it("update keeps the id and re-indexes text", () => {
@@ -101,7 +148,7 @@ describe("CJK search (R2)", () => {
 
   it("rebuilds a pre-versioned bigram-only FTS index on open", () => {
     const dir = mkdtempSync(join(tmpdir(), "dsh-ltm-fts-upgrade-"));
-    tempDirs.push(dir);
+    dirs.push(dir);
     const path = join(dir, "ltm.db");
     const store = new MemoryStore(path);
     store.write("长期记忆系统", []);

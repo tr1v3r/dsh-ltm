@@ -3,16 +3,16 @@
  *
  * The legacy store (`~/.config/dsh/memory/memory.db`, SCHEMA_VERSION=1 with
  * `memories(id,text,tags,pinned,created_at,updated_at)` and an
- * external-content FTS index) is **never opened for writing**: the file (plus
- * its `-wal`/`-shm` siblings, which a read-only open of a live WAL database
- * would need to replay) is copied to a temp directory and the copy is opened.
- * The original bytes on disk therefore stay untouched — verified by tests via
- * sha256 before/after.
+ * external-content FTS index) is **never opened for writing**. A read-only
+ * connection serializes one SQLite-consistent snapshot (including committed WAL
+ * frames) into a temp database; the migration reads only that snapshot. This
+ * avoids a torn main/`-wal`/`-shm` three-file copy and leaves every source file
+ * untouched — verified by tests via sha256 before/after.
  *
  * @module dsh-ltm/migrate
  */
 
-import { copyFileSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -53,19 +53,19 @@ export function migrateLegacy(sourcePath: string, store: MemoryStore): Migration
   const failures: MigrationReport["failures"] = [];
 
   try {
-    // Copy db + sidecars so WAL recovery happens on the copy, not the source.
     const tempDb = join(tempDir, "legacy.db");
-    copyFileSync(sourcePath, tempDb);
-    for (const suffix of ["-wal", "-shm"]) {
-      try {
-        copyFileSync(sourcePath + suffix, tempDb + suffix);
-      } catch {
-        // absent sidecar is the normal case for a cleanly closed database
-      }
-    }
-    const db = new DatabaseSync(tempDb, { readOnly: true });
+    const source = new DatabaseSync(sourcePath, { readOnly: true });
     try {
-      const rows = db.prepare("SELECT * FROM memories ORDER BY id").all() as unknown as LegacyRow[];
+      // serialize() uses SQLite's connection snapshot, so committed WAL frames
+      // are captured atomically without racing independent filesystem copies.
+      writeFileSync(tempDb, source.serialize());
+    } finally {
+      source.close();
+    }
+
+    const snapshot = new DatabaseSync(tempDb, { readOnly: true });
+    try {
+      const rows = snapshot.prepare("SELECT * FROM memories ORDER BY id").all() as unknown as LegacyRow[];
       sourceCount = rows.length;
       for (const row of rows) {
         try {
@@ -96,7 +96,7 @@ export function migrateLegacy(sourcePath: string, store: MemoryStore): Migration
         }
       }
     } finally {
-      db.close();
+      snapshot.close();
     }
   } finally {
     rmSync(tempDir, { recursive: true, force: true });

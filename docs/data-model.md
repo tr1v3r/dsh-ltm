@@ -35,6 +35,9 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
 
 要点：
 
+- 打开已有库先用只读查询校验 `meta.schema_version`，再执行 `journal_mode=WAL`
+  或 DDL。版本值只接受规范的非负十进制整数字符串（如 `1`）；未来版本、无版本、
+  脏值以及没有显式迁移路径的旧版本都 fail-closed，拒绝时不修改数据库文件。
 - FTS 虚表存**分词后文本**而非原文；原文只在 `memories.text`。CJK run 同时
   写入逐字 unigram 和相邻 bigram：单字查询可命中长文本，bigram 保留多字短语的
   选择性。检索 = 查询同构分词 → 去重、全引号拼 `OR` MATCH → BM25 候选。
@@ -46,10 +49,14 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
 旧库（SCHEMA_VERSION=1, `memories(id,text,tags,pinned,created_at,updated_at)` +
 external-content FTS）只读打开：
 
-1. 复制文件到临时位置再打开（绝不在原文件上写）。
+1. 用只读 SQLite 连接的 `serialize()` 取得单个一致快照（包含已提交 WAL 帧），写入
+   临时数据库后读取；不逐个复制主库/`-wal`/`-shm`，也不在源库执行 checkpoint。
 2. 逐行映射：`scope=''`、`last_confirmed_at=updated_at`、tags 沿用规范化。
 3. 每行先过 dedupe（对已迁移内容），命中计入 `dedupedCount`。
 4. 产出 `MigrationReport`（见 contracts.ts）；失败行记录 `{legacyId, reason}`。
+
+迁移不捕获或降级文件系统/SQLite I/O 错误；真实原因直接返回调用方。源主库和 WAL
+字节在迁移前后保持不变（`-shm` 是 SQLite 的共享内存协调文件，读连接可更新它）。
 
 ## 3. 检索管线
 
