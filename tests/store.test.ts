@@ -66,6 +66,22 @@ describe("MemoryStore basics", () => {
     expect(store.list({ tags: ["x"] }).map((r) => r.text).sort()).toEqual(["a", "b"]);
     expect(store.list({ scope: "work", tags: ["y"] })).toHaveLength(2);
   });
+
+  it("tag filter treats LIKE wildcards literally (regression: H-2)", () => {
+    const store = open();
+    // Underscore is a legal tag character AND a SQL LIKE single-char wildcard.
+    // The old `LIKE '% tag %'` with no ESCAPE matched `build_tool` against
+    // `build-tool` and `buildxtool`, returning unrelated records.
+    store.write("exact", ["build_tool"]);
+    store.write("dash", ["build-tool"]);
+    store.write("letter", ["buildxtool"]);
+    const hits = store.list({ tags: ["build_tool"] });
+    expect(hits.map((r) => r.text)).toEqual(["exact"]);
+    // A `%` in a tag must not act as a multi-char wildcard either.
+    store.write("pct", ["a%b"]);
+    store.write("pcty", ["axxxb"]);
+    expect(store.list({ tags: ["a%b"] }).map((r) => r.text)).toEqual(["pct"]);
+  });
 });
 
 describe("CJK search (R2)", () => {

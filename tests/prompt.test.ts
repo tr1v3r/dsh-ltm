@@ -68,6 +68,45 @@ describe("renderPrompt", () => {
     expect(text).toMatch(/more memories not shown/);
   });
 
+  it("drops recent, never a larger pinned, under a tight budget (regression: H-4)", () => {
+    // A large pinned entry followed by a small recent one. The old greedy loop
+    // used `continue`, so the large pinned line was skipped while the small
+    // recent line was still emitted — inverting R9 (lost the always-relevant
+    // fact, kept the disposable one).
+    const records = [
+      record({ id: 1, text: "P".repeat(1990), pinned: true }),
+      record({ id: 2, text: "short recent" }),
+    ];
+    const text = renderPrompt(records, {
+      promptMaxChars: 2000,
+      escapeSequences: [],
+      staleAfterDays: 90,
+    });
+    expect(text).toContain("#1");
+    expect(text).not.toContain("#2");
+    expect(text).toMatch(/more memories not shown/);
+  });
+
+  it("guarantees at least a truncated first pinned when it exceeds the budget (regression: M-1)", () => {
+    // A single pinned line larger than the whole budget previously erased the
+    // entire recall section (returned ""), silently hiding an always-relevant
+    // fact. It must instead survive, truncated on a code-point boundary.
+    const records = [
+      record({ id: 1, text: "常识".repeat(500), pinned: true }),
+      record({ id: 2, text: "recent" }),
+    ];
+    const text = renderPrompt(records, {
+      promptMaxChars: 300,
+      escapeSequences: [],
+      staleAfterDays: 90,
+    });
+    expect(text).toContain("#1");
+    expect(text.length).toBeLessThanOrEqual(300);
+    expect(text).toContain("…");
+    // Never split a multi-byte character: the body is whole code points only.
+    expect(text.includes("\uFFFD")).toBe(false);
+  });
+
   it("returns empty for no records or nothing fitting", () => {
     expect(renderPrompt([], config)).toBe("");
     expect(

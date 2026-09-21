@@ -12,6 +12,8 @@ import { loadConfig } from "./config.js";
 import { MemoryStore } from "./store.js";
 import {
   createToolSet,
+  memoryRecordOutputSchema,
+  memorySearchResultOutputSchema,
   memoryWriteOutputSchema,
   serializers,
   type WriteToolOutput,
@@ -163,16 +165,7 @@ export function apply(ctx: Context, rawConfig: unknown) {
             results: {
               type: "array",
               required: true,
-              items: {
-                type: "object",
-                additionalProperties: false,
-                properties: {
-                  id: { type: "integer", required: true },
-                  text: { type: "string", required: true },
-                  tags: { type: "string", required: true },
-                  pinned: { type: "boolean", required: true },
-                },
-              },
+              items: memorySearchResultOutputSchema,
             },
           },
         },
@@ -184,17 +177,7 @@ export function apply(ctx: Context, rawConfig: unknown) {
                 ? `No memories match ${JSON.stringify(args.query)}.`
                 : value.results
                     .map((hit) =>
-                      promptLine(
-                        {
-                          ...hit,
-                          scope: "",
-                          createdAt: 0,
-                          updatedAt: 0,
-                          lastConfirmedAt: 0,
-                        },
-                        config.escapeSequences,
-                        config.staleAfterDays,
-                      ),
+                      promptLine(hit, config.escapeSequences, config.staleAfterDays),
                     )
                     .join("\n"),
           },
@@ -347,23 +330,14 @@ export function apply(ctx: Context, rawConfig: unknown) {
             records: {
               type: "array",
               required: true,
-              items: {
-                type: "object",
-                additionalProperties: false,
-                properties: {
-                  id: { type: "integer", required: true },
-                  text: { type: "string", required: true },
-                  tags: { type: "string", required: true },
-                  pinned: { type: "boolean", required: true },
-                },
-              },
+              items: memoryRecordOutputSchema,
             },
           },
         },
-        render: (_args, value: ReturnType<typeof serializers.record> extends
-          infer _R
-          ? { records: { id: number; text: string; pinned?: boolean; tags?: string }[] }
-          : never) => [
+        render: (
+          _args,
+          value: { records: NonNullable<ReturnType<typeof serializers.record>>[] },
+        ) => [
           {
             type: "text",
             text:
@@ -371,19 +345,7 @@ export function apply(ctx: Context, rawConfig: unknown) {
                 ? "No memories match the filter."
                 : value.records
                     .map((record) =>
-                      promptLine(
-                        {
-                          ...record,
-                          tags: record.tags ?? "",
-                          pinned: record.pinned ?? false,
-                          scope: "",
-                          createdAt: 0,
-                          updatedAt: 0,
-                          lastConfirmedAt: 0,
-                        },
-                        config.escapeSequences,
-                        config.staleAfterDays,
-                      ),
+                      promptLine(record, config.escapeSequences, config.staleAfterDays),
                     )
                     .join("\n"),
           },
@@ -392,12 +354,7 @@ export function apply(ctx: Context, rawConfig: unknown) {
       async execute(args) {
         const { records } = tools.memory_list(args);
         return {
-          records: records.map((record) => ({
-            id: record.id,
-            text: record.text,
-            tags: record.tags,
-            pinned: record.pinned,
-          })),
+          records: records.map((record) => serializers.record(record)!),
         };
       },
     }),

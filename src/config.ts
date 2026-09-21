@@ -43,7 +43,16 @@ export function escapeForPrompt(
   let out = text;
   for (const sequence of escapeSequences) {
     if (sequence.length < 2 || sequence.includes(ZERO_WIDTH_SPACE)) continue;
-    out = out.replaceAll(sequence, escapeSequence(sequence));
+    const escaped = escapeSequence(sequence);
+    // `replaceAll` consumes non-overlapping matches left-to-right, so a cluster
+    // of an odd number of the lead character (e.g. "{{{" or "{{{ .x }}}") leaves
+    // a trailing raw pair — a live template sequence that defeats R9. Repeat
+    // until no raw occurrence remains. Each pass only inserts zero-width spaces
+    // (which can never form a new raw sequence), so the raw-match count strictly
+    // decreases: the loop terminates and stays idempotent on already-escaped text.
+    while (out.includes(sequence)) {
+      out = out.replaceAll(sequence, escaped);
+    }
   }
   return out;
 }

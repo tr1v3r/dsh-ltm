@@ -81,17 +81,38 @@ function parseArgv(argv: readonly string[]): ParsedArgs {
   };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i] as string;
-    if (arg === "--json") {
+    // Support the `--flag=value` form uniformly (e.g. `--db=/tmp/x.db`). The
+    // previous parser only matched the space-separated `--db <path>` token, so
+    // `--db=/tmp/x.db` fell through to the bare-flag branch and was silently
+    // ignored — the CLI then read/wrote the DEFAULT database with no warning.
+    const eq = arg.startsWith("--") ? arg.indexOf("=") : -1;
+    const name = eq >= 0 ? arg.slice(0, eq) : arg;
+    const inlineValue = eq >= 0 ? arg.slice(eq + 1) : undefined;
+    if (name === "--json") {
+      if (inlineValue !== undefined) fail("--json takes no value");
       parsed.json = true;
-    } else if (arg === "--db") {
-      const value = argv[++i];
-      if (value === undefined) fail("missing value for --db");
+    } else if (name === "--db") {
+      let value = inlineValue;
+      if (value === undefined) {
+        const next = argv[++i];
+        if (next === undefined || next.startsWith("--")) fail("missing value for --db");
+        value = next;
+      }
       parsed.db = value;
-    } else if (VALUE_FLAGS.has(arg)) {
-      const value = argv[++i];
-      if (value === undefined) fail(`missing value for ${arg}`);
-      parsed.flags[arg.slice(2)] = value;
+    } else if (VALUE_FLAGS.has(name)) {
+      let value = inlineValue;
+      if (value === undefined) {
+        const next = argv[++i];
+        // A bare value flag greedily consumed the next token even when it was
+        // another option, so `edit 1 --text --json` stored the literal "--json"
+        // and silently dropped JSON mode. Reject a following option; a value
+        // that must start with `--` can be given as `--flag=--value`.
+        if (next === undefined || next.startsWith("--")) fail(`missing value for ${name}`);
+        value = next;
+      }
+      parsed.flags[name.slice(2)] = value;
     } else if (arg.startsWith("--")) {
+      if (inlineValue !== undefined) fail(`unknown flag ${name}`);
       parsed.boolFlags.add(arg.slice(2));
     } else if (parsed.command === undefined) {
       parsed.command = arg;

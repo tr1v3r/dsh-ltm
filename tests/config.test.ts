@@ -16,10 +16,19 @@ describe("escapeForPrompt", () => {
     );
   });
 
-  it("handles nested {{{{ as two non-overlapping hits", () => {
-    expect(escapeForPrompt("{{{{", ["{{"])).toBe(
-      `{${ZWSP}{{${ZWSP}{`,
-    );
+  it("fully escapes a nested {{{{ run leaving no raw sequence", () => {
+    // Two naive non-overlapping replacements would yield `{{{{` -> `{<ZWSP>{{<ZWSP>{`,
+    // whose middle two braces are again a raw `{{` (a template-injection bypass).
+    // Every brace must be separated so the result contains no raw `{{`.
+    const out = escapeForPrompt("{{{{", ["{{"]);
+    expect(out).toBe(`{${ZWSP}{${ZWSP}{${ZWSP}{`);
+    expect(out.includes("{{")).toBe(false);
+  });
+
+  it("fully escapes odd-length brace runs (no raw sequence survives)", () => {
+    for (const raw of ["{{{", "{{{{{", "{{{ .payload }}}"]) {
+      expect(escapeForPrompt(raw, ["{{"]).includes("{{")).toBe(false);
+    }
   });
 
   it("is idempotent on already-escaped text", () => {

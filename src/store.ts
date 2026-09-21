@@ -46,7 +46,11 @@ export interface StoreOptions {
 export const DEFAULT_STORE_OPTIONS: StoreOptions = {
   staleAfterDays: 90,
   dedupeThreshold: 0.8,
-  dedupeCosineThreshold: 1,
+  // Mirrors the plugin config default (`ConfigSchema.dedupeCosineThreshold`), so
+  // direct library use and the plugin/CLI (which always pass the config value)
+  // dedupe identically. Previously this was 1 (cosine dedupe effectively off),
+  // diverging from the 0.92 every plugin deployment actually runs with.
+  dedupeCosineThreshold: 0.92,
   maxTextChars: 2000,
   searchLimitMax: 50,
   now: Date.now,
@@ -256,10 +260,19 @@ export class MemoryStore implements MemoryStoreContract {
       params.push(filter.scope);
     }
     if (filter?.tags !== undefined) {
-      // AND semantics over the space-joined tag list, whole-word matches only.
+      // Whole-tag AND semantics over the normalized space-joined tag list.
+      // `instr()` matches the literal substring, so SQL LIKE wildcards in a tag
+      // (`_` and `%` — `_` is a legal tag character) are treated literally
+      // rather than as pattern metacharacters. The previous `LIKE '% tag %'`
+      // had no ESCAPE clause, so a tag like `build_tool` also matched
+      // `build-tool`/`buildXtool`. A tag that normalizes to empty can never be
+      // a discrete entry in the space-delimited list, so the filter matches
+      // nothing.
       for (const tag of filter.tags) {
-        conditions.push("(' ' || tags || ' ') LIKE ?");
-        params.push(`% ${normalizeTags([tag])} %`);
+        const normalized = normalizeTags([tag]);
+        if (normalized.length === 0) return [];
+        conditions.push("instr(' ' || tags || ' ', ' ' || ? || ' ') > 0");
+        params.push(normalized);
       }
     }
     if (filter?.stale !== undefined) {

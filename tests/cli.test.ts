@@ -152,5 +152,33 @@ describe("cli", () => {
       await runCli(["--db", join(dir, "x.db"), "--json", "list"]),
     ).toBe(0); // fresh db is fine
   });
+
+  it("accepts the --flag=value form for --db (regression: H-5)", async () => {
+    // `--db=PATH` previously fell through to the default database silently,
+    // so writes/reads hit the wrong file. The inline form must target PATH.
+    const target = join(dir, "inline.db");
+    const writer = new MemoryStore(target);
+    writer.write("inline-db fact", ["cli"]);
+    writer.close();
+    expect(await runCli([`--db=${target}`, "search", "inline-db"])).toBe(0);
+    expect(stdout()).toContain("inline-db fact");
+  });
+
+  it("rejects a value flag that swallows the next option (regression: M-7)", async () => {
+    // `edit <id> --text --json` must not treat `--json` as the new text; a
+    // value flag followed by another option is a missing value, exit 1.
+    const writer = new MemoryStore(db());
+    const { record } = writer.write("original", ["cli"]);
+    writer.close();
+    expect(
+      await runCli(["--db", db(), "edit", String(record!.id), "--text", "--json"]),
+    ).toBe(1);
+    expect(errChunks.join("")).toMatch(/missing value/i);
+  });
+
+  it("rejects --db with no following value (regression: M-7)", async () => {
+    expect(await runCli(["--db", "--json", "list"])).toBe(1);
+    expect(errChunks.join("")).toMatch(/missing value/i);
+  });
 });
 
