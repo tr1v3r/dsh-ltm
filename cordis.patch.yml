@@ -12,7 +12,7 @@
 
 - insert:
     - id: ltm
-      name: dsh-ltm
+      name: '@tr1v3r/dsh-ltm'
       config:
         path: !!js dshHomePath('memory/ltm.db')
         defaultScope: ''

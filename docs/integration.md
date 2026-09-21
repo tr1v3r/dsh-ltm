@@ -49,8 +49,8 @@ CI（参照 dsh-quote-followup 惯例，已写入仓库）：
 在 chezmoi source（`~/.local/share/chezmoi/dot_config/dsh/profiles/`）改，然后 `chezmoi apply`：
 
 1. `dsh-tui/package.json` 与 `web/package.json`：
-   - `dependencies`：删 `"dsh-memory": "^0.1.0"`，加 `"dsh-ltm": "^0.1.0"`（发布后）。
-   - `dsh.profile.bundles`：列表里 `"dsh-memory"` → `"dsh-ltm"`。
+   - `dependencies`：删 `"dsh-memory": "^0.1.0"`，加 `"@tr1v3r/dsh-ltm": "^0.1.0"`（发布后）。
+   - `dsh.profile.bundles`：列表里 `"dsh-memory"` → `"@tr1v3r/dsh-ltm"`。
 2. 删本地 patch 残留：
    - live：`rm ~/.config/dsh/profiles/web/patches/dsh-memory@0.1.0.patch`（悬空 symlink）；
    - 确认两 profile 的 `pnpm-workspace.yaml` 无 `dsh-memory*` 的 `patchedDependencies` 键
@@ -117,7 +117,7 @@ npm publish --provenance --access public --registry https://registry.npmjs.org
 ```
 
 发布后：dotfiles 依赖装的就是 npm 版；`minimumReleaseAgeExclude` 若 pnpm 因最小发布年龄
-拒绝安装，把 `dsh-ltm@0.1.0` 加进对应 profile 的 `pnpm-workspace.yaml`。
+拒绝安装，把 `@tr1v3r/dsh-ltm@0.1.0` 加进对应 profile 的 `pnpm-workspace.yaml`。
 
 ## 6. 明确不做（本任务）
 

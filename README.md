@@ -15,7 +15,7 @@ The plugin ships a bundle patch (`cordis.patch.yml`) so a profile installs it as
 # in the profile's cordis.patch.yml (or via `dsh plugin`)
 - insert:
     - id: ltm
-      name: dsh-ltm
+      name: '@tr1v3r/dsh-ltm'
       config:
         path: !!js dshHomePath('memory/ltm.db')
 ```
@@ -58,7 +58,7 @@ New:
 ## CLI
 
 ```sh
-npx dsh-ltm --db /path/to/ltm.db <command> [--json]
+npx -p @tr1v3r/dsh-ltm dsh-ltm --db /path/to/ltm.db <command> [--json]
 ```
 
 `list / search / show / edit / tag / pin / merge / confirm / export / import / migrate` — every command supports `--json` for machine-readable output. Default database: `$DSH_HOME/memory/ltm.db`.
