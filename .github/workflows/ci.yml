@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        # version comes from packageManager in package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build
+      - name: Smoke the CLI
+        run: |
+          node bin/dsh-ltm.mjs --help
+          T="$(mktemp -d)"
+          printf '{"format":"dsh-ltm-export/1","records":[{"text":"CI smoke 记忆","tags":["ci"]}]}' > "$T/in.json"
+          node bin/dsh-ltm.mjs --db "$T/ltm.db" import "$T/in.json" | grep -q 'imported 1'
+          node bin/dsh-ltm.mjs --db "$T/ltm.db" search "记忆" | grep -q 'CI smoke'
+
+  pack:
+    # Publishes are manual, but the files whitelist is easy to break silently.
+    # Fail early when the packed tarball no longer matches expectations.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - name: Pack and assert contents
+        run: |
+          pnpm pack --pack-destination .
+          tar tzf dsh-ltm-*.tgz | sed 's|^package/||' | grep -v '^$' | sort > packed.txt
+          printf '%s\n' LICENSE README.md bin/dsh-ltm.mjs cordis.patch.yml \
+            dist/cli.d.ts dist/cli.js dist/index.d.ts dist/index.js \
+            dist/prompt-DmwR6shM.js package.json | sort > expected.txt
+          # Hashed bundle chunks under dist/ may rename on rebuild; treat them
+          # as replaceable, everything else must match exactly.
+          grep -v '^dist/prompt-.*\.js$' packed.txt | sort > packed-core.txt
+          grep -v '^dist/prompt-.*\.js$' expected.txt | sort > expected-core.txt
+          if ! diff -u expected-core.txt packed-core.txt; then
+            echo "unexpected packed contents"; exit 1
+          fi
+          echo "packed contents OK: $(wc -l < packed.txt) files"
+      - name: Clean up pack artifacts
+        if: always()
+        run: rm -f dsh-ltm-*.tgz packed.txt packed-core.txt expected.txt expected-core.txt

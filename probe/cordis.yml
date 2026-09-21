@@ -1,0 +1,23 @@
+# Minimal entry list for the P2 real-boot probe: the two services dsh-ltm
+# injects, plus dsh-ltm itself from the built dist of this workspace.
+- id: tools
+  name: '@deepseek-ai/dsh-tools'
+  config: {}
+- id: system-prompt
+  name: '@deepseek-ai/dsh-system-prompt'
+  config: {}
+- id: ltm
+  name: ../dist/index.js
+  config:
+    path: probe/tmp/ltm.db
+    defaultScope: ''
+    escapeSequences: ['{{']
+    promptRecentCount: 10
+    promptMaxChars: 2000
+    maxTextChars: 2000
+    searchLimitDefault: 10
+    searchLimitMax: 50
+    promptOrder: 50
+    dedupeThreshold: 0.8
+    dedupeCosineThreshold: 0.92
+    staleAfterDays: 90

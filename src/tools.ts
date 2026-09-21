@@ -1,0 +1,265 @@
+/**
+ * Model-facing tool logic (P1' surface).
+ *
+ * Pure {@link ToolSet} implementations bound to a store and config; the
+ * Cordis layer (`index.ts`) and the CLI (`cli.ts`) both call into these so
+ * validation, clamping, and dedupe-on-write semantics exist exactly once.
+ *
+ * Compatibility (contracts §compat): `memory_write` / `memory_search` /
+ * `memory_forget` keep the legacy parameter shapes; new tools
+ * (`memory_update` / `memory_confirm` / `memory_list` / `memory_merge`)
+ * extend the set (§4).
+ *
+ * @module dsh-ltm/tools
+ */
+
+import type {
+  Config,
+  DedupeHit,
+  MemoryRecord,
+  MemoryStore,
+  SearchResult,
+  ToolSet,
+} from "./contracts.js";
+import type { ObjectValueSchemaSpec } from "@deepseek-ai/dsh-tools";
+import { normalizeTags } from "./tokenize.js";
+
+/** Public projection of a record for tool output: never more than needed. */
+function publicRecord(record: MemoryRecord) {
+  return {
+    id: record.id,
+    text: record.text,
+    tags: record.tags,
+    scope: record.scope,
+    pinned: record.pinned,
+    createdAt: record.createdAt,
+    updatedAt: record.updatedAt,
+    lastConfirmedAt: record.lastConfirmedAt,
+  };
+}
+
+/** Public projection of a dedupe hit. */
+function publicHit(hit: DedupeHit) {
+  return {
+    id: hit.record.id,
+    text: hit.record.text,
+    tags: hit.record.tags,
+    scope: hit.record.scope,
+    similarity: hit.similarity,
+    measure: hit.measure,
+  };
+}
+
+/**
+ * Build the seven-tool set over one store.
+ *
+ * @param store - the live memory store (owns its own thresholds).
+ * @param config - validated plugin config.
+ * @returns the {@link ToolSet} implementation.
+ */
+export function createToolSet(store: MemoryStore, config: Config): ToolSet {
+  function requireText(text: string): string {
+    const trimmed = text.trim();
+    if (trimmed.length === 0) {
+      throw new Error("memory_write: `text` must not be blank");
+    }
+    if (trimmed.length > config.maxTextChars) {
+      throw new Error(
+        `memory_write: \`text\` is ${trimmed.length} chars, over the ${config.maxTextChars} limit`,
+      );
+    }
+    return trimmed;
+  }
+
+  function clampLimit(limit: number | undefined): number {
+    const requested = limit ?? config.searchLimitDefault;
+    if (!Number.isInteger(requested) || requested < 1) {
+      throw new Error(
+        `memory_search: \`limit\` must be an integer >= 1 (got ${requested})`,
+      );
+    }
+    return Math.min(requested, config.searchLimitMax);
+  }
+
+  return {
+    memory_write(args) {
+      const text = requireText(args.text);
+      const { record, dedupeHits } = store.write(text, args.tags ?? [], {
+        scope: config.defaultScope,
+        pinned: args.pinned ?? false,
+        force: args.force ?? false,
+      });
+      return {
+        record: record as MemoryRecord,
+        dedupeHits,
+      };
+    },
+
+    memory_search(args) {
+      const results = store.search(
+        args.query,
+        clampLimit(args.limit),
+        config.defaultScope || undefined,
+      );
+      return { results };
+    },
+
+    memory_forget(args) {
+      return { deleted: store.forget(args.id) };
+    },
+
+    memory_update(args) {
+      const patch: {
+        text?: string;
+        tags?: readonly string[];
+        pinned?: boolean;
+      } = {};
+      if (args.text !== undefined) patch.text = requireText(args.text);
+      if (args.tags !== undefined) patch.tags = normalizeTagsList(args.tags);
+      if (args.pinned !== undefined) patch.pinned = args.pinned;
+      const record = store.update(args.id, patch);
+      return { record };
+    },
+
+    memory_confirm(args) {
+      return { confirmed: store.confirm(args.id) };
+    },
+
+    memory_list(args) {
+      const filter: {
+        scope?: string;
+        tags?: readonly string[];
+        stale?: boolean;
+        limit?: number;
+      } = {};
+      if (args.scope !== undefined) filter.scope = args.scope;
+      if (args.tags !== undefined) filter.tags = args.tags;
+      if (args.stale !== undefined) filter.stale = args.stale;
+      if (args.limit !== undefined) filter.limit = args.limit;
+      const records = store.list(filter);
+      return { records };
+    },
+
+    memory_merge(args) {
+      const input: {
+        targetId: number;
+        sourceIds: readonly number[];
+        text?: string;
+        tags?: readonly string[];
+      } = { targetId: args.targetId, sourceIds: args.sourceIds };
+      if (args.text !== undefined) input.text = args.text;
+      if (args.tags !== undefined) input.tags = normalizeTagsList(args.tags);
+      const record = store.merge(input);
+      return { record };
+    },
+  };
+}
+
+/** Normalize a model-supplied tag array through the engine's normalizer. */
+function normalizeTagsList(tags: readonly string[]): string[] {
+  return normalizeTags(tags).split(" ").filter((tag) => tag.length > 0);
+}
+
+/**
+ * JSON Schema of `memory_write`'s execute() return value (the shape
+ * {@link serializers.write} produces). Declared here so tests can validate
+ * actual outputs against the exact schema the Cordis layer registers.
+ */
+export const memoryWriteOutputSchema = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    written: { type: "boolean", required: true },
+    record: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        id: { type: "integer", required: true },
+        text: { type: "string", required: true },
+        tags: { type: "string", required: true },
+        scope: { type: "string", required: true },
+        pinned: { type: "boolean", required: true },
+        createdAt: { type: "integer", required: true },
+        updatedAt: { type: "integer", required: true },
+        lastConfirmedAt: { type: "integer", required: true },
+      },
+    },
+    dedupeHits: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          id: { type: "integer", required: true },
+          text: { type: "string", required: true },
+          tags: { type: "string", required: true },
+          scope: { type: "string", required: true },
+          similarity: { type: "number", required: true },
+          measure: { type: "string", required: true },
+        },
+      },
+    },
+    hint: { type: "string" },
+  },
+} satisfies ObjectValueSchemaSpec;
+
+/** Serializers shared by the Cordis layer and the CLI's JSON output. */
+/** Projection of a record in tool output. */
+export interface RecordProjection {
+  id: number;
+  text: string;
+  tags: string;
+  scope: string;
+  pinned: boolean;
+  createdAt: number;
+  updatedAt: number;
+  lastConfirmedAt: number;
+}
+
+/** Projection of a dedupe hit in tool output. */
+export interface HitProjection {
+  id: number;
+  text: string;
+  tags: string;
+  scope: string;
+  similarity: number;
+  measure: "jaccard" | "cosine";
+}
+
+/** Shape of `memory_write`'s execute() return; mirrors memoryWriteOutputSchema. */
+export interface WriteToolOutput {
+  written: boolean;
+  record?: RecordProjection;
+  dedupeHits: HitProjection[];
+  hint?: string;
+}
+
+/** Serializers shared by the Cordis layer and the CLI's JSON output. */
+export const serializers = {
+  write(value: { record?: MemoryRecord; dedupeHits: DedupeHit[] }): WriteToolOutput {
+    const hits = value.dedupeHits.map(publicHit);
+    if (value.dedupeHits.length > 0) {
+      // Blocked by dedupe: `record` echoes the closest existing entry (see
+      // store.write), so it must not be reported as newly written.
+      return {
+        written: false,
+        dedupeHits: hits,
+        hint: "similar memories exist; call memory_merge or re-send with force: true",
+      };
+    }
+    const output: WriteToolOutput = { written: true, dedupeHits: hits };
+    if (value.record !== undefined) output.record = publicRecord(value.record);
+    return output;
+  },
+  search(value: { results: SearchResult[] }) {
+    return {
+      results: value.results.map((hit) => ({
+        ...publicRecord(hit),
+        score: hit.score,
+      })),
+    };
+  },
+  record(record: MemoryRecord | undefined) {
+    return record === undefined ? undefined : publicRecord(record);
+  },
+};
