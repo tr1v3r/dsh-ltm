@@ -9,7 +9,7 @@
  * @module dsh-ltm/store
  */
 
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
@@ -96,14 +96,31 @@ export class MemoryStore implements MemoryStoreContract {
     if (path.length === 0) throw new Error("dsh-ltm: `path` must not be empty");
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
     this.#options = { ...DEFAULT_STORE_OPTIONS, ...options };
+
+    // Preflight an existing database on a READ-ONLY handle, before the
+    // read-write handle is even created. Opening a WAL database read-write is
+    // itself destructive: SQLite folds the WAL into the main file and removes
+    // `-wal`/`-shm` when the last connection closes, so a database this version
+    // must refuse (newer schema, unknown shape) would still be rewritten by the
+    // refusal. A read-only connection leaves the main file and `-wal` alone
+    // (`-shm`, SQLite's shared-memory coordination file, may be created or
+    // updated even then).
+    if (path !== ":memory:" && existsSync(path)) {
+      const probe = new DatabaseSync(path, { readOnly: true });
+      try {
+        assertSchemaCompatible(probe);
+      } finally {
+        probe.close();
+      }
+    }
+
     this.#db = new DatabaseSync(path, { timeout: 5000 });
     try {
-      // This read-only preflight must precede journal-mode changes and DDL: an
-      // unsupported database is rejected without changing any source bytes.
-      assertSchemaCompatible(this.#db);
       this.#db.exec("PRAGMA journal_mode = WAL");
       this.#db.exec("PRAGMA busy_timeout = 5000");
       this.#db.exec("PRAGMA foreign_keys = ON");
+      // `ensureSchema` re-asserts on this read-write handle: the database could
+      // have appeared or changed between the preflight and this open.
       ensureSchema(this.#db);
       this.#ensureFtsTokenVersion();
     } catch (error) {

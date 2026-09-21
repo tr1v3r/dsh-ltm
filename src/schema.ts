@@ -44,10 +44,20 @@ const DDL = `
 /**
  * Validate any existing schema metadata without executing a write statement.
  * Empty databases are accepted for first-time initialization.
+ *
+ * Called on a dedicated read-only connection before the read-write handle
+ * exists (see `store.ts`), so a rejected database keeps its main file and
+ * `-wal` bytes; this function itself must stay read-only.
  */
 export function assertSchemaCompatible(db: DatabaseSync): void {
+  // `ESCAPE` matters: without it `_` is a LIKE wildcard, so a database whose
+  // only table is named e.g. `sqliteXfoo` (a legal name; only the literal
+  // `sqlite_` prefix is reserved) looked like an empty database and the plugin
+  // would inject its schema into an unknown one.
   const objects = db
-    .prepare("SELECT name FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' LIMIT 1")
+    .prepare(
+      "SELECT name FROM sqlite_schema WHERE name NOT LIKE 'sqlite\\_%' ESCAPE '\\' LIMIT 1",
+    )
     .get() as { name: string } | undefined;
   const hasMeta = db
     .prepare("SELECT 1 AS present FROM sqlite_schema WHERE type = 'table' AND name = 'meta'")
@@ -60,6 +70,18 @@ export function assertSchemaCompatible(db: DatabaseSync): void {
       );
     }
     return;
+  }
+
+  // A `meta`-named table from an unrelated schema must be refused with the
+  // designed message instead of leaking `no such column: value`.
+  const columns = db.prepare("SELECT name FROM pragma_table_info('meta')").all() as {
+    name: string;
+  }[];
+  const columnNames = new Set(columns.map((column) => column.name));
+  if (!columnNames.has("key") || !columnNames.has("value")) {
+    throw new Error(
+      "dsh-ltm: existing database has an unrecognized `meta` table; refusing to modify an unknown schema",
+    );
   }
 
   const row = db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as
