@@ -110,6 +110,15 @@ describe("tool set (surface over real engine)", () => {
     expect(tools.memory_confirm({ id: "*" }).confirmed).toBe(2);
   });
 
+  it("memory_list validates and hard-caps limits", () => {
+    const limitedConfig = { ...config, searchLimitMax: 2 };
+    const tools = createToolSet(store, limitedConfig);
+    for (const text of ["one", "two", "three"]) tools.memory_write({ text, force: true });
+    expect(() => tools.memory_list({ limit: 0 })).toThrow(/memory_list/);
+    expect(() => tools.memory_list({ limit: 1.5 })).toThrow(/memory_list/);
+    expect(tools.memory_list({ limit: 999 }).records).toHaveLength(2);
+  });
+
   it("memory_list filters by tags (AND) and scope", () => {
     const tools = createToolSet(store, config);
     tools.memory_write({ text: "a", tags: ["x", "y"] });

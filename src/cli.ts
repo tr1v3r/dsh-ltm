@@ -16,7 +16,8 @@ import { loadConfig } from "./config.js";
 import { MemoryStore } from "./store.js";
 import { migrateLegacy } from "./migrate.js";
 import { isStale } from "./prompt.js";
-import type { Config } from "./contracts.js";
+import type { Config, MemoryRecord } from "./contracts.js";
+import { normalizeTags } from "./tokenize.js";
 
 /** Long options that take a value. */
 const VALUE_FLAGS = new Set([
@@ -72,6 +73,21 @@ function fail(message: string): never {
   throw new ProcessExit(1);
 }
 
+const COMMAND_FLAGS: Record<string, { values?: readonly string[]; bools?: readonly string[]; min: number; max?: number }> = {
+  list: { values: ["scope", "tags", "limit"], bools: ["stale", "fresh", "pinned"], min: 0, max: 0 },
+  search: { values: ["limit"], min: 1 },
+  show: { min: 1, max: 1 },
+  edit: { values: ["text"], min: 1, max: 1 },
+  tag: { values: ["tags"], min: 1, max: 1 },
+  pin: { bools: ["off"], min: 1, max: 1 },
+  merge: { values: ["text", "tags"], min: 2 },
+  confirm: { bools: ["all"], min: 0, max: 1 },
+  export: { values: ["out"], min: 0, max: 0 },
+  import: { min: 1, max: 1 },
+  migrate: { values: ["source"], min: 0, max: 1 },
+  help: { min: 0, max: 0 },
+};
+
 function parseArgv(argv: readonly string[]): ParsedArgs {
   const parsed: ParsedArgs = {
     json: false,
@@ -120,6 +136,32 @@ function parseArgv(argv: readonly string[]): ParsedArgs {
       parsed.positionals.push(arg);
     }
   }
+  if (parsed.command !== undefined) {
+    const spec = COMMAND_FLAGS[parsed.command];
+    if (spec !== undefined) {
+      const allowedValues = new Set(spec.values ?? []);
+      const allowedBools = new Set(spec.bools ?? []);
+      for (const flag of Object.keys(parsed.flags)) {
+        if (!allowedValues.has(flag)) fail(`${parsed.command}: unknown flag --${flag}`);
+      }
+      for (const flag of parsed.boolFlags) {
+        if (!allowedBools.has(flag)) fail(`${parsed.command}: unknown flag --${flag}`);
+      }
+      if (parsed.positionals.length < spec.min) fail(`${parsed.command}: missing argument`);
+      if (spec.max !== undefined && parsed.positionals.length > spec.max) {
+        fail(`${parsed.command}: unexpected argument ${JSON.stringify(parsed.positionals[spec.max])}`);
+      }
+      if (parsed.command === "list" && parsed.boolFlags.has("stale") && parsed.boolFlags.has("fresh")) {
+        fail("list: --stale and --fresh are mutually exclusive");
+      }
+      if (parsed.command === "confirm" && parsed.boolFlags.has("all") && parsed.positionals.length > 0) {
+        fail("confirm: <id> and --all are mutually exclusive");
+      }
+      if (parsed.command === "migrate" && parsed.flags.source !== undefined && parsed.positionals.length > 0) {
+        fail("migrate: <legacyDbPath> and --source are mutually exclusive");
+      }
+    }
+  }
   return parsed;
 }
 
@@ -143,6 +185,38 @@ function toInt(value: string | undefined, what: string): number {
 function toId(value: string | undefined): number {
   if (value === undefined) fail("missing <id>");
   return toInt(value, "id");
+}
+
+function parseImportPayload(value: unknown): MemoryRecord[] {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) fail("import: not an export file");
+  const payload = value as Record<string, unknown>;
+  if (payload.format !== "dsh-ltm-export/1" || !Array.isArray(payload.records)) {
+    fail("import: unsupported or invalid export format");
+  }
+  const seen = new Set<number>();
+  return payload.records.map((raw, index) => {
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) fail(`import: invalid record at index ${index}`);
+    const record = raw as Record<string, unknown>;
+    const integer = (key: string, positive = false): number => {
+      const item = record[key];
+      if (!Number.isSafeInteger(item) || (positive && (item as number) < 1) || (!positive && (item as number) < 0)) {
+        fail(`import: record ${index} has invalid ${key}`);
+      }
+      return item as number;
+    };
+    const id = integer("id", true);
+    if (seen.has(id)) fail(`import: duplicate id #${id} in export`);
+    seen.add(id);
+    if (typeof record.text !== "string" || record.text.trim().length === 0) fail(`import: record ${index} has invalid text`);
+    if (typeof record.tags !== "string" || normalizeTags(record.tags.split(" ")) !== record.tags) fail(`import: record ${index} has invalid tags`);
+    if (typeof record.scope !== "string") fail(`import: record ${index} has invalid scope`);
+    if (typeof record.pinned !== "boolean") fail(`import: record ${index} has invalid pinned`);
+    const createdAt = integer("createdAt");
+    const updatedAt = integer("updatedAt");
+    const lastConfirmedAt = integer("lastConfirmedAt");
+    if (updatedAt < createdAt) fail(`import: record ${index} has updatedAt before createdAt`);
+    return { id, text: record.text, tags: record.tags, scope: record.scope, pinned: record.pinned, createdAt, updatedAt, lastConfirmedAt };
+  });
 }
 
 /** Human one-liner for a record. */
@@ -369,27 +443,8 @@ export async function runCli(argv: readonly string[]): Promise<number> {
         case "import": {
           const file = positionals[0];
           if (file === undefined) fail("import: missing <file>");
-          const parsedImport = JSON.parse(readFileSync(resolve(file), "utf8")) as {
-            records?: unknown;
-          };
-          if (!Array.isArray(parsedImport.records)) fail("import: not an export file");
-          let imported = 0;
-          let skipped = 0;
-          for (const raw of parsedImport.records) {
-            const record = raw as Record<string, unknown>;
-            const text = typeof record.text === "string" ? record.text : "";
-            if (text.trim().length === 0) {
-              skipped++;
-              continue;
-            }
-            const tags = typeof record.tags === "string" ? record.tags.split(" ") : [];
-            const { record: written } = store.write(text, tags, {
-              scope: typeof record.scope === "string" ? record.scope : "",
-              pinned: record.pinned === true,
-              force: true,
-            });
-            if (written !== undefined) imported++;
-          }
+          const records = parseImportPayload(JSON.parse(readFileSync(resolve(file), "utf8")));
+          const { imported, skipped } = store.importRecords(records);
           out(json, { imported, skipped }, `imported ${imported}, skipped ${skipped}`);
           return 0;
         }

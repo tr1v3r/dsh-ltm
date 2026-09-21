@@ -61,7 +61,9 @@ New:
 npx -p @tr1v3r/dsh-ltm dsh-ltm --db /path/to/ltm.db <command> [--json]
 ```
 
-`list / search / show / edit / tag / pin / merge / confirm / export / import / migrate` — every command supports `--json` for machine-readable output. Default database: `$DSH_HOME/memory/ltm.db`.
+`list / search / show / edit / tag / pin / merge / confirm / export / import / migrate` — every command supports `--json` for machine-readable output. Unknown flags, mutually exclusive flags, and surplus positional arguments are rejected. Default database: `$DSH_HOME/memory/ltm.db`.
+
+`export` emits `dsh-ltm-export/1`; `import` validates the complete payload and restores IDs, timestamps, normalized tags, scope, pinned state, and stale lifecycle. Re-importing an identical ID is skipped; an ID whose stored value differs aborts the entire import without partial writes.
 
 ### Migrating from dsh-memory
 
