@@ -22,20 +22,22 @@ CREATE TABLE IF NOT EXISTS memories (
   last_confirmed_at INTEGER NOT NULL
 );
 
--- CJK 二元分词索引（detail=none, content 自持有；不用 external-content，
+-- CJK 单字 + 二元分词索引（content 自持有；不用 external-content，
 -- 因为 token 是自定义分词结果，需要重建能力）
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
   text, tags, scope,
   tokenize = 'unicode61'
 );
--- 索引列存的是 tokenize() 产物（拉丁整词 + CJK bigram），写入/更新/删除
--- 与 memories 表同事务维护。
+-- 索引列存的是 tokenize() 产物（拉丁整词 + CJK unigram/bigram），写入/更新/删除
+-- 与 memories 表同事务维护。meta.fts_token_version 独立跟踪派生 token 格式；
+-- 版本缺失或过旧时，打开库会从 memories 原文原子重建整个 FTS 表。
 ```
 
 要点：
 
-- FTS 虚表存**分词后文本**而非原文；原文只在 `memories.text`。检索 = 
-  查询分词 → 全引号拼 MATCH → BM25 排序。
+- FTS 虚表存**分词后文本**而非原文；原文只在 `memories.text`。CJK run 同时
+  写入逐字 unigram 和相邻 bigram：单字查询可命中长文本，bigram 保留多字短语的
+  选择性。检索 = 查询同构分词 → 去重、全引号拼 `OR` MATCH → BM25 候选。
 - WAL + `busy_timeout=5000`；所有写操作单事务包裹（含 FTS 同步）。
 - `stale` 不是列：`last_confirmed_at + staleAfterDays*86400000 < now` 派生。
 
@@ -58,7 +60,9 @@ query ─tokenize→ tokens ─全引号 MATCH→ FTS5/BM25 候选
 candidates ──rerank──────────────┘
 ```
 
-- BM25 归一化：`1 - rank / max(rank)`（rank 越小越好）。
+- BM25 归一化：FTS5 `rank` 越小越好且通常为负数；在本批候选内使用
+  `(worstRank - rank) / (worstRank - bestRank)`，最佳映射为 1、最差映射为 0。
+  单候选或全部同 rank 时无可区分的跨度，统一映射为 1。
 - n-gram 余弦对原文（而非 token）计算，覆盖二元分词的同义改写召回。
 - 默认权重 `w = 0.6`（实现期可调，写入 ADR-001 附录）。
 

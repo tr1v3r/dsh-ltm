@@ -1,8 +1,14 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 
+import { BM25_WEIGHT, ngramCosine } from "../src/search.js";
 import { MemoryStore } from "../src/store.js";
 
 const stores: MemoryStore[] = [];
+const tempDirs: string[] = [];
 function open(options?: ConstructorParameters<typeof MemoryStore>[1]): MemoryStore {
   const store = new MemoryStore(":memory:", options);
   stores.push(store);
@@ -10,6 +16,7 @@ function open(options?: ConstructorParameters<typeof MemoryStore>[1]): MemorySto
 }
 afterEach(() => {
   for (const store of stores.splice(0)) store.close();
+  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
 describe("MemoryStore basics", () => {
@@ -85,6 +92,31 @@ describe("MemoryStore basics", () => {
 });
 
 describe("CJK search (R2)", () => {
+  it("a single CJK character matches inside a multi-character run", () => {
+    const store = open();
+    store.write("长期记忆系统", []);
+    store.write("完全无关内容", []);
+    expect(store.search("忆").map((hit) => hit.text)).toEqual(["长期记忆系统"]);
+  });
+
+  it("rebuilds a pre-versioned bigram-only FTS index on open", () => {
+    const dir = mkdtempSync(join(tmpdir(), "dsh-ltm-fts-upgrade-"));
+    tempDirs.push(dir);
+    const path = join(dir, "ltm.db");
+    const store = new MemoryStore(path);
+    store.write("长期记忆系统", []);
+    store.close();
+
+    const db = new DatabaseSync(path);
+    db.prepare("DELETE FROM meta WHERE key = 'fts_token_version'").run();
+    db.prepare("UPDATE memories_fts SET text = ? WHERE rowid = 1").run("长期 期记 记忆 忆系 系统");
+    db.close();
+
+    const reopened = new MemoryStore(path);
+    stores.push(reopened);
+    expect(reopened.search("忆")).toHaveLength(1);
+  });
+
   it("pure-Chinese query hits text containing the term", () => {
     const store = open();
     store.write("用户偏好：dsh-ltm 是一个带中文分词的记忆插件", ["zh"]);
@@ -124,6 +156,21 @@ describe("CJK search (R2)", () => {
 });
 
 describe("hybrid rerank (R3 default tier)", () => {
+  it("gives a better negative FTS5 rank a larger BM25 component", () => {
+    const store = open();
+    store.write("alpha alpha alpha focused", [], { force: true });
+    store.write("alpha broad note with several unrelated filler words", [], { force: true });
+    const hits = store.search("alpha");
+    expect(hits).toHaveLength(2);
+
+    const byRank = [...hits].sort((a, b) => a.ftsRank - b.ftsRank);
+    expect(byRank[0]!.ftsRank).toBeLessThan(byRank[1]!.ftsRank);
+    const bm25Component = (hit: (typeof hits)[number]): number =>
+      (hit.score - (1 - BM25_WEIGHT) * ngramCosine("alpha", hit.text)) / BM25_WEIGHT;
+    expect(bm25Component(byRank[0]!)).toBeCloseTo(1);
+    expect(bm25Component(byRank[1]!)).toBeCloseTo(0);
+  });
+
   it("ranks a synonym-rewritten query above a weaker keyword match", () => {
     const store = open();
     store.write("跨会话记忆系统：把对话要点存进长期记忆", []);
