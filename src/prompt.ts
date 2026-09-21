@@ -51,10 +51,50 @@ export function promptLine(
  */
 export { isStale };
 
+/** Ellipsis appended to a truncation, never counted as a record. */
+const TRUNCATION_MARKER = "…";
+
+/** Omission notice for `dropped` records left out; `""` when nothing was. */
+function omissionNotice(dropped: number): string {
+  return dropped > 0 ? `\n(${dropped} more memories not shown; use memory_search)` : "";
+}
+
+/**
+ * Truncate `line` to at most `room` UTF-16 code units without splitting a
+ * surrogate pair. `room` is measured in the same units as `String#length`
+ * (what the budget compares against), so an astral character cannot overflow
+ * the budget by counting as one code point.
+ */
+function truncateToUnits(line: string, room: number): string {
+  if (room <= 0) return "";
+  let out = "";
+  for (const point of line) {
+    if (out.length + point.length > room) break;
+    out += point;
+  }
+  return out;
+}
+
+/** One rendered line plus whether it came from a pinned record, and the
+ * `- (#id` prefix that makes the record identifiable when truncated. */
+interface RenderedLine {
+  line: string;
+  pinned: boolean;
+  identity: string;
+}
+
 /**
  * Render the section body under a character budget. Pinned memories are
  * emitted first (the store returns them first), so a budget too small for
  * everything keeps what the deployment explicitly marked as always-relevant.
+ *
+ * Invariants (regression-tested in `tests/prompt.test.ts`):
+ * - the rendered section is never longer than `promptMaxChars`;
+ * - a recent line is only ever emitted when every pinned line was emitted;
+ * - a pinned line is never evicted; when only the optional omission notice
+ *   cannot fit, the notice gives way;
+ * - when no pinned line fits the budget, the first pinned line is emitted
+ *   truncated (code-point safe) rather than the section being dropped (M-1).
  *
  * @param records - pinned records followed by recent ones.
  * @param config - prompt rendering knobs (`promptMaxChars`, `escapeSequences`).
@@ -66,72 +106,94 @@ export function renderPrompt(
 ): string {
   if (records.length === 0) return "";
   const budget = config.promptMaxChars;
-  const render = (record: MemoryRecord): string =>
-    promptLine(record, config.escapeSequences, config.staleAfterDays);
-  const pinned = records.filter((r) => r.pinned).map(render);
-  const recent = records.filter((r) => !r.pinned).map(render);
+  const render = (record: MemoryRecord): RenderedLine => ({
+    line: promptLine(record, config.escapeSequences, config.staleAfterDays),
+    pinned: record.pinned,
+    identity: `- (#${record.id}`,
+  });
+  // Pinned first regardless of the caller's order; `forPrompt` already does
+  // this, but the renderer must not depend on it.
+  const pinnedLines = records.filter((r) => r.pinned).map(render);
+  const recentLines = records.filter((r) => !r.pinned).map(render);
 
-  const kept: string[] = [];
+  // Greedy pass. `used` is HEADER plus one separator per accepted line, which
+  // is a deliberate upper bound on the final string's length: the budget is
+  // respected even though the first line needs no separator.
+  const kept: RenderedLine[] = [];
   let used = HEADER.length;
-  let dropped = 0;
+  let omitted = 0;
 
   // Pinned memories are what the deployment marked always-relevant (R9): fit as
   // many as possible, skipping any single line too large for the budget.
-  let pinnedDropped = 0;
-  for (const line of pinned) {
-    if (used + line.length + 1 <= budget) {
-      kept.push(line);
-      used += line.length + 1;
+  for (const entry of pinnedLines) {
+    if (used + 1 + entry.line.length <= budget) {
+      kept.push(entry);
+      used += 1 + entry.line.length;
     } else {
-      pinnedDropped++;
+      omitted++;
     }
   }
-  // Recent lines are disposable. The previous loop used `continue`, so a large
-  // pinned line was skipped while a smaller later recent line was still emitted —
-  // exactly the R9 inversion (always-relevant lost, disposable kept). Only render
-  // recent lines when every pinned line fit.
-  if (pinnedDropped === 0) {
-    for (const line of recent) {
-      if (used + line.length + 1 <= budget) {
-        kept.push(line);
-        used += line.length + 1;
+  // Recent lines are disposable, and only rendered when every pinned line fit:
+  // otherwise a large pinned line could be skipped while a smaller later recent
+  // line was still emitted — exactly the R9 inversion (always-relevant lost,
+  // disposable kept).
+  if (omitted === 0) {
+    for (const entry of recentLines) {
+      if (used + 1 + entry.line.length <= budget) {
+        kept.push(entry);
+        used += 1 + entry.line.length;
       } else {
-        dropped++;
+        omitted++;
       }
     }
   } else {
-    dropped += recent.length;
+    omitted += recentLines.length;
   }
-  dropped += pinnedDropped;
 
   // A single pinned line larger than the whole budget would otherwise erase the
   // recall section entirely, silently dropping an always-relevant fact. Guarantee
   // at least the first pinned memory, truncated on a code-point boundary (never
-  // mid-character) with an ellipsis, accounting for the omission notice.
-  if (kept.length === 0 && pinned.length > 0) {
-    dropped = records.length - 1;
-    const notice =
-      dropped > 0 ? `\n(${dropped} more memories not shown; use memory_search)` : "";
-    const marker = "…";
-    const room = Math.max(0, budget - HEADER.length - notice.length - marker.length);
-    const truncated = Array.from(pinned[0]!).slice(0, room).join("") + marker;
-    return HEADER + truncated + notice;
+  // mid-character) with an ellipsis. The optional omission notice is kept only
+  // when it still leaves the pinned record identifiable (`(#id` survives);
+  // otherwise the always-relevant content wins over a pointer to the rest.
+  if (kept.length === 0 && pinnedLines.length > 0) {
+    const first = pinnedLines[0]!;
+    const bodyBudget = budget - HEADER.length - TRUNCATION_MARKER.length;
+    if (bodyBudget < 0) return "";
+    const notice = omissionNotice(records.length - 1);
+    if (notice.length > 0 && bodyBudget - notice.length > 0) {
+      const body = truncateToUnits(first.line, bodyBudget - notice.length);
+      // Keep the notice only when the pinned record stays identifiable
+      // (`- (#id` survives the truncation).
+      if (body.includes(first.identity)) {
+        return HEADER + body + TRUNCATION_MARKER + notice;
+      }
+    }
+    return (
+      HEADER + truncateToUnits(first.line, bodyBudget) + TRUNCATION_MARKER
+    );
   }
 
   if (kept.length === 0) return "";
 
-  // The omission notice counts against the budget too; appending it after the
-  // greedy pass can overflow `promptMaxChars`. Evict trailing (lowest-priority,
-  // i.e. recent-most) lines until the complete rendered section fits.
-  while (kept.length > 0) {
-    const tail =
-      dropped > 0 ? `\n(${dropped} more memories not shown; use memory_search)` : "";
-    const out = HEADER + kept.join("\n") + tail;
-    if (out.length <= budget) return out;
-    kept.pop();
-    dropped++;
+  // The omission notice competes for the budget. Evict disposable recent lines
+  // only — never a pinned one — and, if even that is not enough, drop the
+  // optional notice itself. `HEADER + kept-pinned` always fits, because the
+  // greedy pass accepted every kept line under the budget.
+  for (;;) {
+    const tail = omissionNotice(omitted);
+    if (used + tail.length <= budget) {
+      return HEADER + kept.map((entry) => entry.line).join("\n") + tail;
+    }
+    const last = kept[kept.length - 1];
+    if (last !== undefined && !last.pinned) {
+      kept.pop();
+      used -= 1 + last.line.length;
+      omitted++;
+      continue;
+    }
+    return HEADER + kept.map((entry) => entry.line).join("\n");
   }
-  return "";
 }
 
 /**
