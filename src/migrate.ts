@@ -6,8 +6,9 @@
  * external-content FTS index) is **never opened for writing**. A read-only
  * connection serializes one SQLite-consistent snapshot (including committed WAL
  * frames) into a temp database; the migration reads only that snapshot. This
- * avoids a torn main/`-wal`/`-shm` three-file copy and leaves every source file
- * untouched — verified by tests via sha256 before/after.
+ * avoids a torn main/`-wal`/`-shm` three-file copy and leaves the source main
+ * database and its `-wal` untouched — verified by tests via sha256 before/after.
+ * Opening even read-only can still update the `-shm` sidecar.
  *
  * @module dsh-ltm/migrate
  */

@@ -94,11 +94,30 @@ export function assertSchemaCompatible(db: DatabaseSync): void {
   }
 }
 
-/** Apply the current schema after {@link assertSchemaCompatible} succeeds. */
+/**
+ * Apply the current schema after {@link assertSchemaCompatible} succeeds.
+ *
+ * The DDL and the version stamp commit together. Otherwise a crash in that
+ * window would leave a database that {@link assertSchemaCompatible} must then
+ * refuse forever (tables present, no version row) — module initialization must
+ * be all-or-nothing.
+ */
 export function ensureSchema(db: DatabaseSync): void {
   assertSchemaCompatible(db);
-  db.exec(DDL);
-  db.prepare(
-    "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)",
-  ).run(String(SCHEMA_VERSION));
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    db.exec(DDL);
+    db.prepare(
+      "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)",
+    ).run(String(SCHEMA_VERSION));
+    db.exec("COMMIT");
+  } catch (error) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      // SQLite may have rolled the transaction back already; the original
+      // error is the one that matters.
+    }
+    throw error;
+  }
 }
