@@ -4,16 +4,16 @@
  * The legacy store (`~/.config/dsh/memory/memory.db`, SCHEMA_VERSION=1 with
  * `memories(id,text,tags,pinned,created_at,updated_at)` and an
  * external-content FTS index) is **never opened for writing**. A read-only
- * connection serializes one SQLite-consistent snapshot (including committed WAL
- * frames) into a temp database; the migration reads only that snapshot. This
- * avoids a torn main/`-wal`/`-shm` three-file copy and leaves the source main
- * database and its `-wal` untouched — verified by tests via sha256 before/after.
- * Opening even read-only can still update the `-shm` sidecar.
+ * connection produces one SQLite-consistent snapshot (`VACUUM INTO`, including
+ * committed WAL frames) in a temp database; the migration reads only that
+ * snapshot. This avoids a torn main/`-wal`/`-shm` three-file copy and leaves the
+ * source main database and its `-wal` untouched — verified by tests via sha256
+ * before/after. Opening even read-only can still update the `-shm` sidecar.
  *
  * @module dsh-ltm/migrate
  */
 
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -57,9 +57,12 @@ export function migrateLegacy(sourcePath: string, store: MemoryStore): Migration
     const tempDb = join(tempDir, "legacy.db");
     const source = new DatabaseSync(sourcePath, { readOnly: true });
     try {
-      // serialize() uses SQLite's connection snapshot, so committed WAL frames
-      // are captured atomically without racing independent filesystem copies.
-      writeFileSync(tempDb, source.serialize());
+      // VACUUM INTO reads the source through one SQLite transaction, so
+      // committed WAL frames are captured atomically instead of racing
+      // independent filesystem copies. It is used instead of
+      // `DatabaseSync#serialize()`, which only exists from Node 24 on, while
+      // this package still supports Node 22.19.
+      source.prepare("VACUUM INTO ?").run(tempDb);
     } finally {
       source.close();
     }

@@ -49,8 +49,9 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
 旧库（SCHEMA_VERSION=1, `memories(id,text,tags,pinned,created_at,updated_at)` +
 external-content FTS）只读打开：
 
-1. 用只读 SQLite 连接的 `serialize()` 取得单个一致快照（包含已提交 WAL 帧），写入
+1. 用只读 SQLite 连接的 `VACUUM INTO` 取得单个一致快照（包含已提交 WAL 帧），写入
    临时数据库后读取；不逐个复制主库/`-wal`/`-shm`，也不在源库执行 checkpoint。
+   （不用 `DatabaseSync#serialize()`：它只在 Node 24 起存在，本包仍支持 Node 22.19。）
 2. 逐行映射：`scope=''`、`last_confirmed_at=updated_at`、tags 沿用规范化。
 3. 每行先过 dedupe（对已迁移内容），命中计入 `dedupedCount`。
 4. 产出 `MigrationReport`（见 contracts.ts）；失败行记录 `{legacyId, reason}`。
