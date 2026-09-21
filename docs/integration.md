@@ -44,6 +44,18 @@ CI（参照 dsh-quote-followup 惯例，已写入仓库）：
   `v<package.json version>`；走 npm Trusted Publishing（OIDC + provenance，无存储 token）。
   一次性设置：npmjs.com 包设置 → Publishing access → 绑定本仓库 + `publish` workflow。
 
+`main` 分支保护（2026-09-21 经用户确认后已生效；classic branch protection，配置只存在于
+GitHub 侧，仓库里没有声明文件）：
+
+- 只能经 PR 合并（`required_approving_review_count=0`：solo 维护者可自合并，但不能自批准，
+  故批准数必须为 0，否则死锁）。
+- 必检状态 `test (22)`、`test (24)`、`pack`（对应 ci.yml 的两个 matrix job 与 pack job，
+  检查名需逐字一致），且 `strict=true`（分支落后 main 时需先更新）。
+- 需解决所有 review 对话；禁止强推与删除分支。
+- `enforce_admins=true`：管理员同样不能直推/强推 `main`；紧急情况需先在
+  Settings → Branches 临时关闭保护。
+- 查看：`gh api repos/tr1v3r/dsh-ltm/branches/main/protection`。
+
 ## 2. dotfiles 切换 dsh-memory → dsh-ltm
 
 在 chezmoi source（`~/.local/share/chezmoi/dot_config/dsh/profiles/`）改，然后 `chezmoi apply`：
