@@ -119,6 +119,15 @@ describe("tool set (surface over real engine)", () => {
     expect(tools.memory_list({ limit: 999 }).records).toHaveLength(2);
   });
 
+  it("memory_list without a limit returns every record (R6)", () => {
+    const tools = createToolSet(store, { ...config, searchLimitDefault: 2 });
+    for (const text of ["one", "two", "three", "four"]) {
+      tools.memory_write({ text, force: true });
+    }
+    expect(tools.memory_list({}).records).toHaveLength(4);
+    expect(tools.memory_list({ limit: 2 }).records).toHaveLength(2);
+  });
+
   it("memory_list filters by tags (AND) and scope", () => {
     const tools = createToolSet(store, config);
     tools.memory_write({ text: "a", tags: ["x", "y"] });
