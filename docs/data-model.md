@@ -41,7 +41,8 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
 - FTS 虚表存**分词后文本**而非原文；原文只在 `memories.text`。CJK run 同时
   写入逐字 unigram 和相邻 bigram：单字查询可命中长文本，bigram 保留多字短语的
   选择性。检索 = 查询同构分词 → 去重、全引号拼 `OR` MATCH → BM25 候选。
-- WAL + `busy_timeout=5000`；所有写操作单事务包裹（含 FTS 同步）。
+- WAL + `busy_timeout=5000`；所有写操作单事务包裹（含 FTS 同步）。去重检查在 `BEGIN IMMEDIATE` 后执行，跨连接并发写不会绕过检查。
+- 导出格式 `dsh-ltm-export/1` 保留全部字段；导入严格验证并原样恢复 id/时间戳/tags/scope/pinned。相同 ID 且内容完全一致时幂等跳过，不同则整批事务回滚。
 - `stale` 不是列：`last_confirmed_at + staleAfterDays*86400000 < now` 派生。
 
 ## 2. 迁移（旧 dsh-memory → 新库）

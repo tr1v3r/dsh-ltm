@@ -136,6 +136,61 @@ describe("MemoryStore basics", () => {
     store.write("pcty", ["axxxb"]);
     expect(store.list({ tags: ["a%b"] }).map((r) => r.text)).toEqual(["pct"]);
   });
+
+  it("validates and caps explicit list limits", () => {
+    const store = open({ searchLimitMax: 2 });
+    for (const text of ["one", "two", "three"]) store.write(text, [], { force: true });
+    expect(() => store.list({ limit: 0 })).toThrow(/integer/);
+    expect(() => store.list({ limit: 1.5 })).toThrow(/integer/);
+    expect(store.list({ limit: 99 })).toHaveLength(2);
+  });
+});
+
+describe("cross-connection invariants", () => {
+  it("dedupes the same scoped content across store instances", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ltm-concurrent-"));
+    const path = join(dir, "ltm.db");
+    const first = new MemoryStore(path);
+    const second = new MemoryStore(path);
+    try {
+      const written = first.write("same scoped content", [], { scope: "shared" });
+      const blocked = second.write("same scoped content", [], { scope: "shared" });
+      expect(written.dedupeHits).toHaveLength(0);
+      expect(blocked.dedupeHits.length).toBeGreaterThan(0);
+      expect(second.list({ scope: "shared" })).toHaveLength(1);
+    } finally {
+      first.close();
+      second.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("imports complete records atomically and defines id conflicts", () => {
+    const store = open();
+    const record = { id: 42, text: "restored", tags: "a b", scope: "work", pinned: true, createdAt: 10, updatedAt: 20, lastConfirmedAt: 15 };
+    expect(store.importRecords([record])).toEqual({ imported: 1, skipped: 0 });
+    expect(store.list()[0]).toEqual(record);
+    expect(store.importRecords([record])).toEqual({ imported: 0, skipped: 1 });
+    expect(() => store.importRecords([{ ...record, text: "conflict" }])).toThrow(/conflicts/);
+    expect(store.list()[0]).toEqual(record);
+  });
+
+  it("treats an existing record as identical regardless of property order", () => {
+    const store = open();
+    const record = { id: 7, text: "restored", tags: "a b", scope: "work", pinned: true, createdAt: 10, updatedAt: 20, lastConfirmedAt: 15 };
+    expect(store.importRecords([record])).toEqual({ imported: 1, skipped: 0 });
+    const reordered = {
+      lastConfirmedAt: 15,
+      updatedAt: 20,
+      createdAt: 10,
+      pinned: true,
+      scope: "work",
+      tags: "a b",
+      text: "restored",
+      id: 7,
+    };
+    expect(store.importRecords([reordered])).toEqual({ imported: 0, skipped: 1 });
+  });
 });
 
 describe("CJK search (R2)", () => {
@@ -241,6 +296,15 @@ describe("merge (R4/R6)", () => {
     expect(merged.tags.split(" ").sort()).toEqual(["alpha", "beta", "keep"]);
     expect(store.count()).toBe(1);
     expect(store.search("duplicate fact")).toHaveLength(1);
+  });
+
+  it("rejects invalid replacement text without deleting sources", () => {
+    const store = open({ maxTextChars: 10 });
+    const target = store.write("target", [], { force: true }).record;
+    const source = store.write("source", [], { force: true }).record;
+    expect(() => store.merge({ targetId: target.id, sourceIds: [source.id], text: "   " })).toThrow(/blank/);
+    expect(() => store.merge({ targetId: target.id, sourceIds: [source.id], text: "x".repeat(11) })).toThrow(/limit/);
+    expect(store.list().map((r) => r.id).sort()).toEqual([target.id, source.id].sort());
   });
 
   it("returns undefined for an unknown target", () => {

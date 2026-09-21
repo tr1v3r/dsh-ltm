@@ -175,36 +175,43 @@ export class MemoryStore implements MemoryStoreContract {
     return row === undefined ? undefined : toRecord(row);
   }
 
+  #validateText(text: string, operation: "write" | "update" | "merge" | "import"): string {
+    const trimmed = text.trim();
+    if (trimmed.length === 0) throw new Error(`memory ${operation}: \`text\` must not be blank`);
+    if (trimmed.length > this.#options.maxTextChars) {
+      throw new Error(
+        `memory ${operation}: \`text\` is ${trimmed.length} chars, over the ${this.#options.maxTextChars} limit`,
+      );
+    }
+    return trimmed;
+  }
+
+  #findDuplicates(text: string, scope: string): DedupeHit[] {
+    const rows = this.#db
+      .prepare("SELECT * FROM memories WHERE scope = ? ORDER BY updated_at DESC, id DESC")
+      .all(scope) as Row[];
+    return findDuplicates(text, rows.map(toRecord), {
+      jaccardThreshold: this.#options.dedupeThreshold,
+      cosineThreshold: this.#options.dedupeCosineThreshold,
+    });
+  }
+
   write(
     text: string,
     tags: readonly string[],
     options?: WriteOptions,
   ): { record: MemoryRecord; dedupeHits: DedupeHit[] } {
-    const trimmed = text.trim();
-    if (trimmed.length === 0) throw new Error("memory write: `text` must not be blank");
-    if (trimmed.length > this.#options.maxTextChars) {
-      throw new Error(
-        `memory write: \`text\` is ${trimmed.length} chars, over the ${this.#options.maxTextChars} limit`,
-      );
-    }
+    const trimmed = this.#validateText(text, "write");
     const scope = options?.scope ?? "";
     const normalized = normalizeTags(tags);
-
-    const hits: DedupeHit[] =
-      options?.force === true
-        ? []
-        : findDuplicates(trimmed, this.list({ scope }), {
-            jaccardThreshold: this.#options.dedupeThreshold,
-            cosineThreshold: this.#options.dedupeCosineThreshold,
-          });
-
-    if (hits.length > 0) {
-      // Blocked: surface the closest existing record instead of writing (R4).
-      return { record: hits[0]!.record, dedupeHits: hits };
-    }
-
     const now = this.#now();
-    const record = this.#transaction(() => {
+    return this.#transaction(() => {
+      // BEGIN IMMEDIATE serializes competing writers before the dedupe read,
+      // closing the check-then-insert race across store instances.
+      const hits = options?.force === true ? [] : this.#findDuplicates(trimmed, scope);
+      if (hits.length > 0) {
+        return { record: hits[0]!.record, dedupeHits: hits };
+      }
       const row = this.#db
         .prepare(
           `INSERT INTO memories (text, tags, scope, pinned, created_at, updated_at, last_confirmed_at)
@@ -221,9 +228,8 @@ export class MemoryStore implements MemoryStoreContract {
         ) as Row;
       const created = toRecord(row);
       this.#insertFts(created);
-      return created;
+      return { record: created, dedupeHits: [] };
     });
-    return { record, dedupeHits: [] };
   }
 
   /**
@@ -237,22 +243,20 @@ export class MemoryStore implements MemoryStoreContract {
     record: Omit<MemoryRecord, "id">,
     force?: boolean,
   ): { record: MemoryRecord; dedupeHits: DedupeHit[] } {
-    const hits = findDuplicates(record.text, this.list({ scope: record.scope }), {
-      jaccardThreshold: this.#options.dedupeThreshold,
-      cosineThreshold: this.#options.dedupeCosineThreshold,
-    });
-    if (hits.length > 0 && force !== true) {
-      return { record: hits[0]!.record, dedupeHits: hits };
-    }
-    const inserted = this.#transaction(() => {
+    const text = this.#validateText(record.text, "import");
+    return this.#transaction(() => {
+      const hits = force === true ? [] : this.#findDuplicates(text, record.scope);
+      if (hits.length > 0) {
+        return { record: hits[0]!.record, dedupeHits: hits };
+      }
       const row = this.#db
         .prepare(
           `INSERT INTO memories (text, tags, scope, pinned, created_at, updated_at, last_confirmed_at)
            VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *`,
         )
         .get(
-          record.text,
-          record.tags,
+          text,
+          normalizeTags(record.tags.split(" ")),
           record.scope,
           record.pinned ? 1 : 0,
           record.createdAt,
@@ -261,9 +265,8 @@ export class MemoryStore implements MemoryStoreContract {
         ) as Row;
       const created = toRecord(row);
       this.#insertFts(created);
-      return created;
+      return { record: created, dedupeHits: [] };
     });
-    return { record: inserted, dedupeHits: [] };
   }
 
   search(query: string, limit = 10, scope?: string): SearchResult[] {
@@ -321,7 +324,11 @@ export class MemoryStore implements MemoryStoreContract {
       conditions.push("pinned = ?");
       params.push(filter.pinned ? 1 : 0);
     }
-    params.push(filter?.limit ?? -1);
+    const requestedLimit = filter?.limit;
+    if (requestedLimit !== undefined && (!Number.isInteger(requestedLimit) || requestedLimit < 1)) {
+      throw new Error(`memory list: \`limit\` must be an integer >= 1 (got ${requestedLimit})`);
+    }
+    params.push(requestedLimit === undefined ? -1 : Math.min(requestedLimit, this.#options.searchLimitMax));
     const rows = this.#db
       .prepare(
         `SELECT * FROM memories ${conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : ""}
@@ -329,6 +336,58 @@ export class MemoryStore implements MemoryStoreContract {
       )
       .all(...params) as Row[];
     return rows.map(toRecord);
+  }
+
+  importRecords(records: readonly MemoryRecord[]): { imported: number; skipped: number } {
+    const prepared = records.map((record) => ({
+      ...record,
+      text: this.#validateText(record.text, "import"),
+      tags: normalizeTags(record.tags.split(" ")),
+    }));
+    return this.#transaction(() => {
+      let imported = 0;
+      let skipped = 0;
+      for (const record of prepared) {
+        const existing = this.#get(record.id);
+        if (existing !== undefined) {
+          // Compare fields rather than JSON text: callers may hand us an
+          // object whose property order differs, which must still count as the
+          // same record instead of an id conflict.
+          if (
+            existing.text === record.text &&
+            existing.tags === record.tags &&
+            existing.scope === record.scope &&
+            existing.pinned === record.pinned &&
+            existing.createdAt === record.createdAt &&
+            existing.updatedAt === record.updatedAt &&
+            existing.lastConfirmedAt === record.lastConfirmedAt
+          ) {
+            skipped++;
+            continue;
+          }
+          throw new Error(`memory import: id #${record.id} conflicts with an existing record`);
+        }
+        const row = this.#db
+          .prepare(
+            `INSERT INTO memories
+               (id, text, tags, scope, pinned, created_at, updated_at, last_confirmed_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+          )
+          .get(
+            record.id,
+            record.text,
+            record.tags,
+            record.scope,
+            record.pinned ? 1 : 0,
+            record.createdAt,
+            record.updatedAt,
+            record.lastConfirmedAt,
+          ) as Row;
+        this.#insertFts(toRecord(row));
+        imported++;
+      }
+      return { imported, skipped };
+    });
   }
 
   forPrompt(recentCount: number): MemoryRecord[] {
@@ -347,19 +406,12 @@ export class MemoryStore implements MemoryStoreContract {
     id: number,
     patch: { text?: string; tags?: readonly string[]; pinned?: boolean },
   ): MemoryRecord | undefined {
-    if (patch.text !== undefined && patch.text.trim().length === 0) {
-      throw new Error("memory update: `text` must not be blank");
-    }
-    if (patch.text !== undefined && patch.text.trim().length > this.#options.maxTextChars) {
-      throw new Error(
-        `memory update: \`text\` is ${patch.text.trim().length} chars, over the ${this.#options.maxTextChars} limit`,
-      );
-    }
+    const text = patch.text === undefined ? undefined : this.#validateText(patch.text, "update");
     return this.#transaction(() => {
       const current = this.#get(id);
       if (current === undefined) return undefined;
       const next = {
-        text: patch.text?.trim() ?? current.text,
+        text: text ?? current.text,
         tags: patch.tags !== undefined ? normalizeTags(patch.tags) : current.tags,
         pinned: patch.pinned ?? current.pinned,
       };
@@ -393,6 +445,9 @@ export class MemoryStore implements MemoryStoreContract {
   }
 
   merge(input: MergeInput): MemoryRecord | undefined {
+    const replacementText = input.text === undefined
+      ? undefined
+      : this.#validateText(input.text, "merge");
     return this.#transaction(() => {
       const target = this.#get(input.targetId);
       if (target === undefined) return undefined;
@@ -408,7 +463,7 @@ export class MemoryStore implements MemoryStoreContract {
       const tagUnion = new Set(
         `${target.tags} ${sources.map((s) => s.tags).join(" ")}`.split(/\s+/).filter(Boolean),
       );
-      const text = input.text ?? target.text;
+      const text = replacementText ?? target.text;
       const tags =
         input.tags !== undefined ? normalizeTags(input.tags) : [...tagUnion].sort().join(" ");
       const row = this.#db

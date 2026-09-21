@@ -71,11 +71,11 @@ export function createToolSet(store: MemoryStore, config: Config): ToolSet {
     return trimmed;
   }
 
-  function clampLimit(limit: number | undefined): number {
+  function clampLimit(limit: number | undefined, tool = "memory_search"): number {
     const requested = limit ?? config.searchLimitDefault;
     if (!Number.isInteger(requested) || requested < 1) {
       throw new Error(
-        `memory_search: \`limit\` must be an integer >= 1 (got ${requested})`,
+        `${tool}: \`limit\` must be an integer >= 1 (got ${requested})`,
       );
     }
     return Math.min(requested, config.searchLimitMax);
@@ -135,7 +135,9 @@ export function createToolSet(store: MemoryStore, config: Config): ToolSet {
       if (args.scope !== undefined) filter.scope = args.scope;
       if (args.tags !== undefined) filter.tags = args.tags;
       if (args.stale !== undefined) filter.stale = args.stale;
-      if (args.limit !== undefined) filter.limit = args.limit;
+      // No `limit` means "every record" (R6): only clamp when one was given,
+      // otherwise memory_list would silently truncate to the search default.
+      if (args.limit !== undefined) filter.limit = clampLimit(args.limit, "memory_list");
       const records = store.list(filter);
       return { records };
     },

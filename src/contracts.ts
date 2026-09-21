@@ -128,8 +128,14 @@ export interface MemoryStore {
     { record: MemoryRecord; dedupeHits: DedupeHit[] };
   /** Hybrid search over text and tags, best match first (R2, R3). */
   search(query: string, limit?: number, scope?: ScopeName): SearchResult[];
-  /** Filtered browse (R6, memory_list). */
+  /** Filtered browse (R6, memory_list). Limits are validated and hard-capped. */
   list(filter?: ListFilter): MemoryRecord[];
+  /**
+   * Atomically restore exported records with their ids and lifecycle timestamps.
+   * An identical existing id is skipped; a different record with the same id
+   * aborts the complete import as a conflict.
+   */
+  importRecords(records: readonly MemoryRecord[]): { imported: number; skipped: number };
   /** Records for the recall section: pinned first, then recent, deduped. */
   forPrompt(recentCount: number): MemoryRecord[];
   /** Revise text/tags/pinned in place, keeping the id (memory_update). */
