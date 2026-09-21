@@ -350,7 +350,18 @@ export class MemoryStore implements MemoryStoreContract {
       for (const record of prepared) {
         const existing = this.#get(record.id);
         if (existing !== undefined) {
-          if (JSON.stringify(existing) === JSON.stringify(record)) {
+          // Compare fields rather than JSON text: callers may hand us an
+          // object whose property order differs, which must still count as the
+          // same record instead of an id conflict.
+          if (
+            existing.text === record.text &&
+            existing.tags === record.tags &&
+            existing.scope === record.scope &&
+            existing.pinned === record.pinned &&
+            existing.createdAt === record.createdAt &&
+            existing.updatedAt === record.updatedAt &&
+            existing.lastConfirmedAt === record.lastConfirmedAt
+          ) {
             skipped++;
             continue;
           }

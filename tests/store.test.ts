@@ -174,6 +174,23 @@ describe("cross-connection invariants", () => {
     expect(() => store.importRecords([{ ...record, text: "conflict" }])).toThrow(/conflicts/);
     expect(store.list()[0]).toEqual(record);
   });
+
+  it("treats an existing record as identical regardless of property order", () => {
+    const store = open();
+    const record = { id: 7, text: "restored", tags: "a b", scope: "work", pinned: true, createdAt: 10, updatedAt: 20, lastConfirmedAt: 15 };
+    expect(store.importRecords([record])).toEqual({ imported: 1, skipped: 0 });
+    const reordered = {
+      lastConfirmedAt: 15,
+      updatedAt: 20,
+      createdAt: 10,
+      pinned: true,
+      scope: "work",
+      tags: "a b",
+      text: "restored",
+      id: 7,
+    };
+    expect(store.importRecords([reordered])).toEqual({ imported: 0, skipped: 1 });
+  });
 });
 
 describe("CJK search (R2)", () => {
