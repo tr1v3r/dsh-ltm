@@ -1,5 +1,6 @@
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -33,6 +34,38 @@ function versionedDb(value: string): string {
   db.exec("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
   db.prepare("INSERT INTO meta (key, value) VALUES ('schema_version', ?)").run(value);
   db.close();
+  return path;
+}
+
+/**
+ * Build a WAL database whose committed frames are still in `-wal` with no live
+ * connection: a child process writes with `wal_autocheckpoint` off and then
+ * SIGKILLs itself, so no close-time checkpoint can fold the WAL into the main
+ * file. This is the only shape that exposes the checkpoint side effect of
+ * opening a database read-write.
+ */
+function uncheckpointedWalDb(schemaVersion: string): string {
+  const dir = mkdtempSync(join(tmpdir(), "dsh-ltm-wal-"));
+  dirs.push(dir);
+  const path = join(dir, "ltm.db");
+  const script = `
+    const { DatabaseSync } = require("node:sqlite");
+    const path = process.argv[1];
+    const db = new DatabaseSync(path);
+    db.exec("PRAGMA journal_mode = WAL");
+    db.exec("PRAGMA wal_autocheckpoint = 0");
+    db.exec("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+    db.prepare("INSERT INTO meta (key, value) VALUES ('schema_version', ?)").run(process.argv[2]);
+    db.exec("CREATE TABLE filler (id INTEGER PRIMARY KEY, blob TEXT)");
+    const insert = db.prepare("INSERT INTO filler (blob) VALUES (?)");
+    for (let i = 0; i < 400; i++) insert.run("x".repeat(600));
+    process.kill(process.pid, "SIGKILL");
+  `;
+  const child = spawnSync(process.execPath, ["-e", script, path, schemaVersion], {
+    stdio: "ignore",
+  });
+  expect(child.signal).toBe("SIGKILL");
+  expect(existsSync(path + "-wal")).toBe(true);
   return path;
 }
 
@@ -89,6 +122,56 @@ describe("MemoryStore basics", () => {
     const before = sha256(path);
     expect(() => new MemoryStore(path)).toThrow(/older than supported 1.*no migration path/);
     expect(sha256(path)).toBe(before);
+  });
+
+  it("a rejected WAL database keeps its main and -wal bytes (regression: F2)", () => {
+    // The read-write preflight used to open the WAL database read-write, and the
+    // close that follows the rejection checkpointed the WAL: main grew and
+    // `-wal` disappeared even though the database was refused.
+    const path = uncheckpointedWalDb("2");
+    const mainBefore = sha256(path);
+    const walBefore = sha256(path + "-wal");
+    expect(() => new MemoryStore(path)).toThrow(/newer than supported 1/);
+    expect(sha256(path)).toBe(mainBefore);
+    expect(sha256(path + "-wal")).toBe(walBefore);
+  });
+
+  it("still adopts a valid WAL database through the read-only preflight", () => {
+    const path = uncheckpointedWalDb("1");
+    const store = new MemoryStore(path);
+    stores.push(store);
+    expect(store.count()).toBe(0);
+    expect(store.write("wal preflight ok", []).record.id).toBe(1);
+  });
+
+  it("refuses a database whose only table is hidden by the LIKE wildcard", () => {
+    const dir = mkdtempSync(join(tmpdir(), "dsh-ltm-sqlite-like-"));
+    dirs.push(dir);
+    const path = join(dir, "ltm.db");
+    const db = new DatabaseSync(path);
+    // `sqliteXfoo` is a legal name (only the literal `sqlite_` prefix is
+    // reserved), but `NOT LIKE 'sqlite_%'` treats `_` as a wildcard and used to
+    // make this unknown database look empty.
+    db.exec("CREATE TABLE sqliteXfoo (a TEXT)");
+    db.close();
+    const before = sha256(path);
+    expect(() => new MemoryStore(path)).toThrow(/no schema_version metadata/);
+    expect(sha256(path)).toBe(before);
+    const check = new DatabaseSync(path, { readOnly: true });
+    expect(
+      check.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name").all(),
+    ).toEqual([{ name: "sqliteXfoo" }]);
+    check.close();
+  });
+
+  it("refuses an unrecognized meta table with the designed message", () => {
+    const dir = mkdtempSync(join(tmpdir(), "dsh-ltm-meta-shape-"));
+    dirs.push(dir);
+    const path = join(dir, "ltm.db");
+    const db = new DatabaseSync(path);
+    db.exec("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)");
+    db.close();
+    expect(() => new MemoryStore(path)).toThrow(/unrecognized `meta` table/);
   });
 
   it("update keeps the id and re-indexes text", () => {

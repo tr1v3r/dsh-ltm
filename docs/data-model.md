@@ -35,9 +35,12 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
 
 要点：
 
-- 打开已有库先用只读查询校验 `meta.schema_version`，再执行 `journal_mode=WAL`
-  或 DDL。版本值只接受规范的非负十进制整数字符串（如 `1`）；未来版本、无版本、
-  脏值以及没有显式迁移路径的旧版本都 fail-closed，拒绝时不修改数据库文件。
+- 打开已有库先在**独立只读连接**上校验 `meta.schema_version`（读写句柄本身对 WAL
+  库就是破坏性的：最后一个连接关闭会 checkpoint 并把 `-wal`/`-shm` 融合/删除），
+  通过后才执行 `journal_mode=WAL` 与 DDL。版本值只接受规范的非负十进制整数字符串
+  （如 `1`）；未来版本、无版本、脏值、未识别形状的 `meta` 表以及没有显式迁移路径的
+  旧版本都 fail-closed，拒绝时**主库与 `-wal` 字节不变**（`-shm` 是 SQLite 的共享
+  内存协调文件，只读连接也可能创建/更新它）。
 - FTS 虚表存**分词后文本**而非原文；原文只在 `memories.text`。CJK run 同时
   写入逐字 unigram 和相邻 bigram：单字查询可命中长文本，bigram 保留多字短语的
   选择性。检索 = 查询同构分词 → 去重、全引号拼 `OR` MATCH → BM25 候选。
