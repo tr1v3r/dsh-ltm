@@ -25,7 +25,7 @@ import type {
 import { findDuplicates } from "./dedupe.js";
 import { staleCutoff } from "./expire.js";
 import { compileMatch, rerankResults } from "./search.js";
-import { ensureSchema } from "./schema.js";
+import { assertSchemaCompatible, ensureSchema } from "./schema.js";
 import { joinTokens, normalizeTags, tokenize } from "./tokenize.js";
 
 export interface StoreOptions {
@@ -97,11 +97,20 @@ export class MemoryStore implements MemoryStoreContract {
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
     this.#options = { ...DEFAULT_STORE_OPTIONS, ...options };
     this.#db = new DatabaseSync(path, { timeout: 5000 });
-    this.#db.exec("PRAGMA journal_mode = WAL");
-    this.#db.exec("PRAGMA busy_timeout = 5000");
-    this.#db.exec("PRAGMA foreign_keys = ON");
-    ensureSchema(this.#db);
-    this.#ensureFtsTokenVersion();
+    try {
+      // This read-only preflight must precede journal-mode changes and DDL: an
+      // unsupported database is rejected without changing any source bytes.
+      assertSchemaCompatible(this.#db);
+      this.#db.exec("PRAGMA journal_mode = WAL");
+      this.#db.exec("PRAGMA busy_timeout = 5000");
+      this.#db.exec("PRAGMA foreign_keys = ON");
+      ensureSchema(this.#db);
+      this.#ensureFtsTokenVersion();
+    } catch (error) {
+      this.#db.close();
+      this.#closed = true;
+      throw error;
+    }
   }
 
   /**

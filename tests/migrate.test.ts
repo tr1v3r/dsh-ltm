@@ -126,16 +126,31 @@ describe("migrateLegacy (R8)", () => {
     ]);
   });
 
-  it("works against a real WAL database with an unchecked-in -wal file", () => {
+  it("preserves SQLite errors instead of treating I/O failures as missing sidecars", () => {
+    const dir = mkdtempSync(join(tmpdir(), "dsh-ltm-legacy-bad-"));
+    dirs.push(dir);
+    const source = join(dir, "memory.db");
+    const db = new DatabaseSync(source);
+    db.close();
+    // An empty SQLite file has no legacy table. Its real diagnostic must reach
+    // the caller; there is no sidecar-copy catch that can hide it.
+    const store = new MemoryStore(":memory:");
+    stores.push(store);
+    expect(() => migrateLegacy(source, store)).toThrow(/no such table: memories/);
+  });
+
+  it("serializes a consistent snapshot of a live WAL database", () => {
     const dir = mkdtempSync(join(tmpdir(), "dsh-ltm-legacy-"));
     dirs.push(dir);
     const source = buildLegacyDb(dir);
-    // leave rows in the WAL (no checkpoint) to prove sidecar copying
+    // Leave a committed row in WAL while the writer remains open. The
+    // snapshot must include it without copying the three files independently.
     const db = new DatabaseSync(source);
     db.prepare(
       "INSERT INTO memories (text, tags, pinned, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
     ).run("wal-only row", "", 0, 10_000, 11_000);
     const before = sha256(source);
+    const walBefore = sha256(source + "-wal");
 
     const store = new MemoryStore(":memory:");
     stores.push(store);
@@ -144,9 +159,8 @@ describe("migrateLegacy (R8)", () => {
     expect(report.migratedCount).toBe(4);
     expect(report.failures).toEqual([]);
     expect(sha256(source)).toBe(before);
-    // sidecar may have been checkpointed by the OS on the *copy* only; the
-    // source file itself must not change. (A changed -wal is tolerated: the
-    // source db bytes are the rollback anchor.)
+    expect(sha256(source + "-wal")).toBe(walBefore);
     expect(store.search("wal-only")).toHaveLength(1);
+    db.close();
   });
 });
