@@ -7,7 +7,7 @@
 | 检查 | 命令 | 结果 |
 |---|---|---|
 | 全仓类型检查 | `pnpm typecheck` | ✅ 0 错（t1 报的 surface 残留错误已由 t2 收敛） |
-| 全部单测 | `pnpm test`（vitest run） | ✅ 10 文件 / 108 用例全绿 |
+| 全部单测 | `pnpm test`（vitest run） | ✅ 10 文件 / 112 用例全绿 |
 | 构建 | `pnpm build` | ✅ dist 5 文件，含 bin 所需 `dist/cli.js` |
 | Schema 安全回归 | `tests/store.test.ts` | ✅ 未来版/脏值/无迁移旧版均在 PRAGMA/DDL 前拒绝，sha256 不变 |
 | WAL 快照回归 | `tests/migrate.test.ts` | ✅ 活动 writer + 未 checkpoint WAL 的已提交行进入一致快照，源 db/WAL sha256 不变 |
@@ -54,6 +54,7 @@ createLaunchEnvironmentSnapshot([...process.env]))`。收尾用 `ctx.fiber.dispo
 | F4 | 中 | search/list render 用 `lastConfirmedAt=0` 占位，导致新记录也显示 stale | 已修复：工具输出保留真实 scope 和时间字段，render 直接消费真实记录 |
 | F5 | 中 | omission tail 在截断后追加，最终 prompt 可超过 `promptMaxChars` | 已修复：tail 纳入预算，必要时从末尾移除低优先级记录；单测断言最终长度 |
 | F6 | 低 | 非有限 `promptOrder` 未 fail-loud | 已修复：`loadConfig` 拒绝 `NaN` / `Infinity` |
+| F7 | 高 | 预算驱逐循环可从 `kept` 末尾弹出 pinned 行：`promptMaxChars` 199–233（小样本）或默认 2000 下 pinned 文本 1881–1901 字时整个 recall 分节变为 `""`；截断路径按码点计 room 导致 astral 文本超预算 | 已修复：驱逐只弹 recent；notice 仅在 pinned 仍可辨识时保留；截断按 UTF-16 计长（issue #8） |
 
 ## 5. 结论
 
@@ -63,7 +64,7 @@ P1（核心引擎）+ P1'（插件面）联合验证通过：全测试矩阵绿�
 
 ```sh
 pnpm typecheck && pnpm test && pnpm build
-node probe/boot-probe.mjs                       # 真实 boot 探针（18 断言）
+node probe/boot-probe.mjs                       # 真实 boot 探针（21 断言）
 cp ~/.config/dsh/memory/memory.db* /tmp/ltm-src/
 node bin/dsh-ltm.mjs migrate /tmp/ltm-src/memory.db --db /tmp/ltm-src/ltm.db --json
 node bin/dsh-ltm.mjs search "数据库" --db /tmp/ltm-src/ltm.db --json

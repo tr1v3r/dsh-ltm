@@ -144,6 +144,102 @@ describe("renderPrompt", () => {
     );
     expect(text).toContain("stale");
   });
+
+  it("never evicts a pinned line when the omission notice does not fit", () => {
+    // Regression: the eviction loop used to pop from the end of `kept`, which
+    // contains the pinned lines first. When only the pinned line survived, it
+    // popped that too and returned "" — silently erasing the always-relevant
+    // fact for a whole band of budgets (199..233 in the original report).
+    const records = [
+      record({ id: 1, text: "a".repeat(100), pinned: true }),
+      record({ id: 2, text: "b".repeat(20) }),
+    ];
+    for (let budget = 100; budget <= 400; budget++) {
+      const text = renderPrompt(records, {
+        promptMaxChars: budget,
+        escapeSequences: [],
+        staleAfterDays: 90,
+      });
+      expect(text, `budget=${budget}`).not.toBe("");
+      expect(text, `budget=${budget}`).toContain("(#1");
+      expect(text.length, `budget=${budget}`).toBeLessThanOrEqual(budget);
+    }
+  });
+
+  it("keeps a long pinned memory at the default budget instead of dropping the section", () => {
+    // The old code lost the entire section for pinned texts of ~1881..1901
+    // characters at promptMaxChars=2000 (inside the default maxTextChars).
+    for (let length = 1800; length <= 1950; length++) {
+      const text = renderPrompt(
+        [
+          record({ id: 1, text: "P".repeat(length), pinned: true }),
+          record({ id: 2, text: "recent" }),
+        ],
+        { promptMaxChars: 2000, escapeSequences: [], staleAfterDays: 90 },
+      );
+      expect(text, `length=${length}`).not.toBe("");
+      expect(text, `length=${length}`).toContain("(#1");
+      expect(text.length, `length=${length}`).toBeLessThanOrEqual(2000);
+    }
+  });
+
+  it("respects the budget for astral pinned text and for tiny budgets", () => {
+    const emoji = renderPrompt(
+      [
+        record({ id: 1, text: "\u{1F600}".repeat(400), pinned: true }),
+        record({ id: 2, text: "recent" }),
+      ],
+      { promptMaxChars: 300, escapeSequences: [], staleAfterDays: 90 },
+    );
+    expect(emoji).toContain("(#1");
+    expect(emoji.length).toBeLessThanOrEqual(300);
+
+    // Below HEADER + marker the section cannot be rendered at all; the budget
+    // still wins over emitting an over-long section.
+    const tiny = renderPrompt(
+      [
+        record({ id: 1, text: "x".repeat(5000), pinned: true }),
+        record({ id: 2, text: "recent" }),
+      ],
+      { promptMaxChars: 100, escapeSequences: [], staleAfterDays: 90 },
+    );
+    expect(tiny.length).toBeLessThanOrEqual(100);
+  });
+
+  it("never exceeds the budget or silently erases pinned records (property)", () => {
+    let seed = 20_260_921;
+    const rand = (n: number): number => {
+      seed = (seed * 1_103_515_245 + 12_345) & 0x7fffffff;
+      return seed % n;
+    };
+    for (let trial = 0; trial < 500; trial++) {
+      const count = 1 + rand(6);
+      const records: MemoryRecord[] = [];
+      let pinnedCount = 0;
+      for (let i = 0; i < count; i++) {
+        const pinned = rand(2) === 0;
+        if (pinned) pinnedCount++;
+        const length = [0, 1, 5, 50, 500, 1980, 4000][rand(7)]!;
+        records.push(record({ id: 1000 + i * 7, text: "字".repeat(length), pinned }));
+      }
+      const budget = 1 + rand(3000);
+      const text = renderPrompt(records, {
+        promptMaxChars: budget,
+        escapeSequences: [],
+        staleAfterDays: 90,
+      });
+      expect(text.length, `trial=${trial} budget=${budget}`).toBeLessThanOrEqual(budget);
+      if (pinnedCount > 0 && budget >= 100) {
+        expect(text, `trial=${trial} budget=${budget}`).not.toBe("");
+      }
+      const shows = (id: number): boolean => text.includes(`(#${id}`);
+      const renderedRecent = records.some((r) => !r.pinned && shows(r.id));
+      if (renderedRecent) {
+        const renderedPinned = records.filter((r) => r.pinned && shows(r.id)).length;
+        expect(renderedPinned, `trial=${trial} budget=${budget}`).toBe(pinnedCount);
+      }
+    }
+  });
 });
 
 describe("promptLine", () => {
