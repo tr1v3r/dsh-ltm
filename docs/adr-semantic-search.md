@@ -13,11 +13,17 @@ tokenizer 把整句当一个 token）。
 ## 决策
 
 0.1 的默认档 = CJK 感知分词的 BM25（FTS5 rank）+ **字符 n-gram（2–3）
-余弦相似度**混合重排：
+余弦相似度**混合重排。CJK 连续文本同时索引逐字 unigram 和相邻 bigram：
+unigram 支持单字查询，bigram 继续提供多字短语的精确召回。
 
 ```
+normBM25 = (worstRank − rank) / (worstRank − bestRank)
 score = w · normBM25 + (1 − w) · cosine(ngram(query), ngram(text)),  w = 0.6
 ```
+
+FTS5 rank 越小越好且通常为负数；上述候选集内 min-max 公式将最佳结果
+映射为 1、最差结果映射为 0，避免按正数处理负 rank 而把 BM25 分量全部退化为 1。
+单候选或 rank 全相同时统一取 1。
 
 理由：
 
@@ -41,3 +47,6 @@ score = w · normBM25 + (1 − w) · cosine(ngram(query), ngram(text)),  w = 0.6
 - 检索质量上限受 n-gram 语义粒度限制；接受（个人自用规模 <10⁴ 条）。
 - 每次检索多一轮内存向量计算，O(N·L)；在个人规模下 <10ms，可接受。
 - 若 0.2 引入 embeddings，重排管线形状不变，只替换 cosine 项。
+- token 格式是派生索引版本而非 SQL schema 版本；打开旧库发现
+  `meta.fts_token_version` 缺失/过旧时，从 `memories` 原文在事务内重建 FTS，
+  因而已有 bigram-only 数据无需人工迁移即可获得 unigram 召回。

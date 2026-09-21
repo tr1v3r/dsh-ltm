@@ -1,9 +1,10 @@
 /**
  * CJK-aware tokenizer (R2).
  *
- * Latin/digit/underscore runs become whole lowercase words; CJK runs become
- * overlapping character bigrams (a lone CJK char becomes a unigram). Punctuation
- * and whitespace separate runs.
+ * Latin/digit/underscore runs become whole lowercase words; CJK runs emit both
+ * character unigrams and overlapping bigrams. The unigrams make a one-character
+ * query searchable inside a longer run, while bigrams preserve phrase precision.
+ * Punctuation and whitespace separate runs.
  *
  * Tokens only ever contain word characters or CJK characters, so quoting each
  * token with `"` in an FTS5 MATCH expression is always safe — the FTS layer
@@ -24,8 +25,7 @@ const LATIN = /[A-Za-z0-9_]/;
 const CJK = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3040-\u309f\u30a0-\u30ff]/;
 
 /**
- * Split input into lowercase Latin words and CJK bigrams
- * (unigram fallback for isolated CJK characters).
+ * Split input into lowercase Latin words plus CJK unigrams and bigrams.
  */
 export function tokenizeText(input: string): string[] {
   const chars = Array.from(input);
@@ -42,11 +42,11 @@ export function tokenizeText(input: string): string[] {
       let j = i + 1;
       while (j < chars.length && CJK.test(chars[j]!)) j++;
       const run = chars.slice(i, j);
-      if (run.length === 1) {
-        tokens.push(run[0]!);
-      } else {
-        for (let k = 0; k + 1 < run.length; k++) tokens.push(run[k]! + run[k + 1]!);
-      }
+      // Index/query symmetry matters here: emitting every character allows a
+      // single-character query to match a longer run. Keep overlapping bigrams
+      // as well so multi-character queries retain their more selective terms.
+      tokens.push(...run);
+      for (let k = 0; k + 1 < run.length; k++) tokens.push(run[k]! + run[k + 1]!);
       i = j;
     } else {
       i++;

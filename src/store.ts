@@ -2,7 +2,7 @@
  * The durable memory store (R1): one `node:sqlite` connection per instance,
  * WAL + `busy_timeout`, idempotent `close()`/`dispose()`.
  *
- * The FTS5 virtual table stores tokenized text (Latin words + CJK bigrams);
+ * The FTS5 virtual table stores tokenized text (Latin words + CJK unigrams/bigrams);
  * `memories.text` keeps the original prose. Both are maintained inside the
  * same transaction on every write path.
  *
@@ -42,6 +42,9 @@ export interface StoreOptions {
   /** Injectable clock (tests); defaults to `Date.now`. */
   now: () => number;
 }
+
+/** Version of the derived FTS token stream (independent of the SQL schema). */
+const FTS_TOKEN_VERSION = 2;
 
 export const DEFAULT_STORE_OPTIONS: StoreOptions = {
   staleAfterDays: 90,
@@ -98,6 +101,31 @@ export class MemoryStore implements MemoryStoreContract {
     this.#db.exec("PRAGMA busy_timeout = 5000");
     this.#db.exec("PRAGMA foreign_keys = ON");
     ensureSchema(this.#db);
+    this.#ensureFtsTokenVersion();
+  }
+
+  /**
+   * Rebuild the derived FTS rows when tokenizer semantics change. The SQL
+   * schema is unchanged, so this lightweight data-version marker avoids
+   * coupling an index refresh to the schema migration machinery.
+   */
+  #ensureFtsTokenVersion(): void {
+    const row = this.#db.prepare("SELECT value FROM meta WHERE key = 'fts_token_version'").get() as
+      | { value: string }
+      | undefined;
+    if (row?.value === String(FTS_TOKEN_VERSION)) return;
+
+    this.#transaction(() => {
+      this.#db.exec("DELETE FROM memories_fts");
+      const records = this.#db.prepare("SELECT * FROM memories ORDER BY id").all() as Row[];
+      for (const record of records) this.#insertFts(toRecord(record));
+      this.#db
+        .prepare(
+          `INSERT INTO meta (key, value) VALUES ('fts_token_version', ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+        )
+        .run(String(FTS_TOKEN_VERSION));
+    });
   }
 
   #now(): number {
