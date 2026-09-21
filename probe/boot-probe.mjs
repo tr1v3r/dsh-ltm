@@ -47,11 +47,22 @@ function check(label, ok, detail = "") {
   if (!ok) failures.push(label);
 }
 
+let nextCallId = 1;
+async function executeCall(name, args) {
+  const result = await ctx.tools.execute({
+    callId: `boot-probe-${nextCallId++}`,
+    name,
+    arguments: args,
+    signal: new AbortController().signal,
+  });
+  if (result.isError) {
+    throw new Error(`${name} failed via registry: ${result.error.code}: ${result.error.message}`);
+  }
+  return result;
+}
+
 async function call(name, args) {
-  const tool = ctx.tools.get(name);
-  if (!tool) throw new Error(`tool not registered: ${name}`);
-  const signal = new AbortController().signal;
-  return tool.execute(args, { signal });
+  return (await executeCall(name, args)).value;
 }
 
 // 1. seven tools registered + visible
@@ -75,8 +86,15 @@ const w2 = await call("memory_write", { text: "数据库迁移时把 db+wal+shm 
 const w2id = w2.record?.id ?? w2.id;
 check("CJK write ok", w2.written === true && w2id !== undefined, `id=${w2id}`);
 
-const s1 = await call("memory_search", { query: "release branch squash" });
+const s1Result = await executeCall("memory_search", { query: "release branch squash" });
+const s1 = s1Result.value;
+check("search passes registry output validation", !s1Result.isError);
+check("fresh search result is not rendered stale",
+  !s1Result.content.some((block) => block.type === "text" && block.text.includes("stale")));
 check("latin search finds #1", s1.results.some((r) => r.id === w1id), `${s1.results.length} hit(s)`);
+const listResult = await executeCall("memory_list", {});
+check("fresh list result is not rendered stale",
+  !listResult.content.some((block) => block.type === "text" && block.text.includes("stale")));
 const s2 = await call("memory_search", { query: "迁移 数据库" });
 check("CJK search finds #2", s2.results.some((r) => r.id === w2id), `${s2.results.length} hit(s)`);
 

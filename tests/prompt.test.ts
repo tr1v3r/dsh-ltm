@@ -66,6 +66,24 @@ describe("renderPrompt", () => {
     expect(text).toContain("#1");
     expect(text).not.toContain("#2");
     expect(text).toMatch(/more memories not shown/);
+    expect(text.length).toBeLessThanOrEqual(200);
+  });
+
+  it("counts the omission tail within the exact character budget", () => {
+    const records = [
+      record({ id: 1, text: "a".repeat(25), pinned: true }),
+      record({ id: 2, text: "b".repeat(25) }),
+      record({ id: 3, text: "c".repeat(200) }),
+    ];
+    const budget = 170;
+    const text = renderPrompt(records, {
+      promptMaxChars: budget,
+      escapeSequences: [],
+      staleAfterDays: 90,
+    });
+
+    expect(text).toMatch(/more memories not shown/);
+    expect(text.length).toBeLessThanOrEqual(budget);
   });
 
   it("drops recent, never a larger pinned, under a tight budget (regression: H-4)", () => {

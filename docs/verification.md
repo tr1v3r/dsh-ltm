@@ -7,11 +7,11 @@
 | 检查 | 命令 | 结果 |
 |---|---|---|
 | 全仓类型检查 | `pnpm typecheck` | ✅ 0 错（t1 报的 surface 残留错误已由 t2 收敛） |
-| 全部单测 | `pnpm test`（vitest run） | ✅ 10 文件 / 96 用例全绿 |
+| 全部单测 | `pnpm test`（vitest run） | ✅ 10 文件 / 108 用例全绿 |
 | 构建 | `pnpm build` | ✅ dist 5 文件，含 bin 所需 `dist/cli.js` |
 | Schema 安全回归 | `tests/store.test.ts` | ✅ 未来版/脏值/无迁移旧版均在 PRAGMA/DDL 前拒绝，sha256 不变 |
 | WAL 快照回归 | `tests/migrate.test.ts` | ✅ 活动 writer + 未 checkpoint WAL 的已提交行进入一致快照，源 db/WAL sha256 不变 |
-| 真实 boot 探针 | `node probe/boot-probe.mjs` | ✅ 18/18 断言通过，exit 0 |
+| 真实 boot 探针 | `node probe/boot-probe.mjs` | ✅ 21/21 断言通过，exit 0 |
 
 ## 2. 真实 boot 探针（非 `--dump-config`）
 
@@ -23,12 +23,13 @@
 createLaunchEnvironmentSnapshot([...process.env]))`。收尾用 `ctx.fiber.dispose()`
 （cordis 4 无 `ctx.dispose()`）。
 
-断言与结果（`probe/boot-probe.mjs`，18/18 PASS）：
+断言与结果（`probe/boot-probe.mjs`，21/21 PASS）：
 
 1. **七个工具注册且模型可见**：`ctx.tools.get(name)` + `ctx.tools.schemas()` 均含
    `memory_write/search/forget/update/confirm/list/merge`。
-2. **write→search→confirm→forget 全链路**（经注册后的真实 execute，落盘 SQLite）：
+2. **write→search→confirm→forget 全链路**（统一经 `ctx.tools.execute()` 的 registry runtime，覆盖输入/输出 schema 校验、策略管线与落盘 SQLite；不再直接调用 `tool.execute`）：
    - write 返回 `written=true`（id=1）；近似文本再写被去重拦截（`written=false`，1 hit，sim=1）；
+   - 有命中的 search 通过 registry 输出校验，并返回完整的 scope/时间字段；
    - confirm 单条（string id `"2"`）confirmed=1；`"*"` 全量 confirmed=2；
    - forget 后 search 不再返回该记录。
 3. **中文端到端**：中文写入 → 中文关键词（“迁移 数据库”）检索命中；recall 分节文本含该中文记忆。
@@ -48,11 +49,15 @@ createLaunchEnvironmentSnapshot([...process.env]))`。收尾用 `ctx.fiber.dispo
 | # | 严重度 | 问题 | 处置 |
 |---|---|---|---|
 | F1 | 中 | `bin/dsh-ltm.mjs` 直接 `process.exit(code)`，非 TTY（管道）下大 JSON 输出在 64 KiB 管道缓冲处被静默截断（`list --json` 80 条稳定复现 65536 字节、JSON 解析失败） | 已修复：退出前 `process.stdout.write("", resolve)` 等待排空；管道输出恢复完整（104178 字节、JSON 可解析），`export` 同样验证 |
-| F2 | 低 | `src/index.ts` 中 `memory_write` 的 output schema 声明顶层 `id: integer`，但 execute 实际返回 `record: {id, ...}`（schema `additionalProperties: false`，两者不一致；当前 dsh-tools 未强制校验未炸，但下游一旦按 schema 校验/裁剪会破坏 `record` 字段） | 报告给 surface 维护者，建议 schema 改为 `record`（对齐 `serializers.write`）或 execute 改回顶层 `id` |
+| F2 | 低 | `src/index.ts` 中 `memory_write` 的 output schema 曾与 serializer 不一致 | 已修复：schema 与 `serializers.write` 对齐，并覆盖写入/去重两分支验证 |
+| F3 | 高 | `memory_search` serializer 返回完整记录与 score，但注册 schema 只允许部分字段，registry runtime 对命中结果报 `INVALID_TOOL_OUTPUT` | 已修复：抽取共享完整记录/search-hit schema；boot probe 通过 `ctx.tools.execute()` 验证真实命中 |
+| F4 | 中 | search/list render 用 `lastConfirmedAt=0` 占位，导致新记录也显示 stale | 已修复：工具输出保留真实 scope 和时间字段，render 直接消费真实记录 |
+| F5 | 中 | omission tail 在截断后追加，最终 prompt 可超过 `promptMaxChars` | 已修复：tail 纳入预算，必要时从末尾移除低优先级记录；单测断言最终长度 |
+| F6 | 低 | 非有限 `promptOrder` 未 fail-loud | 已修复：`loadConfig` 拒绝 `NaN` / `Infinity` |
 
 ## 5. 结论
 
-P1（核心引擎）+ P1'（插件面）联合验证通过：全测试矩阵绿、真实 boot 七工具全链路（含中文）通过、真实旧库迁移只读且原库字节不变。F1 已修复，F2 建议在 P3 评审前收敛。可以进入 P3 双评审。
+P1（核心引擎）+ P1'（插件面）联合验证通过：全测试矩阵绿、真实 boot 七工具全链路（含中文及 registry 输出校验）通过、真实旧库迁移只读且原库字节不变。上述 F1–F6 均已收敛，可以进入后续评审。
 
 ## 附：复现命令
 
