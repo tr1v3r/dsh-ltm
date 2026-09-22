@@ -1,0 +1,4 @@
+# Generated standalone viewers and browser evidence; keep JSON sources tracked.
+/*.html
+/*.visual-check.*
+/delivery-receipt.md
