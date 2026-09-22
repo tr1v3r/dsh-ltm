@@ -35,6 +35,10 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
 
 要点：
 
+- `scope=''` 表示全局记忆。插件默认从每个 agent 的 `session.header.cwd` 派生项目
+  scope：Git 仓库使用 canonical common Git directory（linked worktree 共享），非 Git
+  工作区使用 canonical cwd；Git scope 只含路径 SHA-256 短摘要，目录 scope 另带可读 basename，均不存绝对路径。
+  模型召回限制为“当前项目 + 全局”，跨项目聚合仍由 `memory_list`/CLI 显式提供。
 - 打开已有库先在**独立只读连接**上校验 `meta.schema_version`（读写句柄本身对 WAL
   库就是破坏性的：最后一个连接关闭会 checkpoint 并把 `-wal`/`-shm` 融合/删除），
   通过后才执行 `journal_mode=WAL` 与 DDL。版本值只接受规范的非负十进制整数字符串

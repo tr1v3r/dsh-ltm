@@ -27,7 +27,8 @@ The plugin ships a bundle patch (`cordis.patch.yml`) so a profile installs it as
 | key | default | meaning |
 |---|---|---|
 | `path` | *(required)* | SQLite file, or `:memory:` |
-| `defaultScope` | `""` | scope applied when a tool call omits scope |
+| `defaultScope` | `""` | fallback scope, or fixed scope when automatic detection is disabled |
+| `autoProjectScope` | `true` | derive the active project from each agent session's cwd/Git repository |
 | `escapeSequences` | `[]` | optional output sequences broken with a zero-width space before prompt rendering |
 | `promptRecentCount` | `10` | unpinned recent memories in the recall section |
 | `promptMaxChars` | `2000` | character budget of the section; pinned survive first |
@@ -41,6 +42,19 @@ The plugin ships a bundle patch (`cordis.patch.yml`) so a profile installs it as
 Memory text is preserved exactly in recalled prompts by default. `escapeSequences` is an explicit deployment-level opt-in for environments that pass rendered prompts through an additional delimiter-based parser; DSH itself does not require it.
 
 Invalid values (empty path, non-integer bounds, thresholds outside `[0,1]`, escape sequences shorter than 2 chars or containing a zero-width space) throw at plugin load — fail loud, not at first tool call.
+
+### Automatic project isolation
+
+With `autoProjectScope: true`, every agent resolves its own `session.header.cwd`; the shared DSH process cwd is never used. A Git checkout is identified by its canonical common Git directory, so subdirectories and linked worktrees share one project scope. A non-Git workspace is identified by its canonical directory. Git scope names contain only a short SHA-256 digest so every linked-worktree layout stays identical; directory scopes also include a readable basename. Absolute paths are never stored.
+
+Model-facing defaults are intentionally narrow:
+
+- writes and near-duplicate checks use the active project scope;
+- search and automatic prompt recall see only the active project plus global memories (`scope=""`);
+- update, forget, confirm, and merge reject records outside those visible scopes, and merge never crosses scope boundaries;
+- `memory_list` and the CLI remain explicit cross-project aggregation/administration surfaces.
+
+Set `autoProjectScope: false` to use only `defaultScope` as a fixed deployment scope (use `""` for global-only operation). Scope is a context-isolation boundary, not an operating-system permission boundary; anyone with direct access to the SQLite file or CLI can still administer every record.
 
 ## Model-facing tools
 

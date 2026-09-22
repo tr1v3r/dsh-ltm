@@ -22,6 +22,7 @@ import type {
   ToolSet,
 } from "./contracts.js";
 import type { ObjectValueSchemaSpec } from "@deepseek-ai/dsh-tools";
+import { visibleScopes } from "./scope.js";
 import { normalizeTags } from "./tokenize.js";
 
 /** Public projection of a record for tool output: never more than needed. */
@@ -55,9 +56,25 @@ function publicHit(hit: DedupeHit) {
  *
  * @param store - the live memory store (owns its own thresholds).
  * @param config - validated plugin config.
+ * @param scopeContext - agent-local visibility. Omit for CLI/legacy operation.
  * @returns the {@link ToolSet} implementation.
  */
-export function createToolSet(store: MemoryStore, config: Config): ToolSet {
+export interface ToolScopeContext {
+  activeScope: string;
+  includeGlobal: boolean;
+}
+
+export function createToolSet(
+  store: MemoryStore,
+  config: Config,
+  scopeContext?: ToolScopeContext,
+): ToolSet {
+  const operationScope = scopeContext?.activeScope ?? config.defaultScope;
+  const readableScopes =
+    scopeContext === undefined
+      ? undefined
+      : visibleScopes(operationScope, scopeContext.includeGlobal);
+
   function requireText(text: string, op = "memory_write"): string {
     const trimmed = text.trim();
     if (trimmed.length === 0) {
@@ -85,7 +102,7 @@ export function createToolSet(store: MemoryStore, config: Config): ToolSet {
     memory_write(args) {
       const text = requireText(args.text);
       const { record, dedupeHits } = store.write(text, args.tags ?? [], {
-        scope: config.defaultScope,
+        scope: operationScope,
         pinned: args.pinned ?? false,
         force: args.force ?? false,
       });
@@ -99,13 +116,13 @@ export function createToolSet(store: MemoryStore, config: Config): ToolSet {
       const results = store.search(
         args.query,
         clampLimit(args.limit),
-        config.defaultScope || undefined,
+        readableScopes ?? (config.defaultScope || undefined),
       );
       return { results };
     },
 
     memory_forget(args) {
-      return { deleted: store.forget(args.id) };
+      return { deleted: store.forget(args.id, readableScopes) };
     },
 
     memory_update(args) {
@@ -117,12 +134,12 @@ export function createToolSet(store: MemoryStore, config: Config): ToolSet {
       if (args.text !== undefined) patch.text = requireText(args.text, "memory_update");
       if (args.tags !== undefined) patch.tags = normalizeTagsList(args.tags);
       if (args.pinned !== undefined) patch.pinned = args.pinned;
-      const record = store.update(args.id, patch);
+      const record = store.update(args.id, patch, readableScopes);
       return { record };
     },
 
     memory_confirm(args) {
-      return { confirmed: store.confirm(args.id) };
+      return { confirmed: store.confirm(args.id, readableScopes) };
     },
 
     memory_list(args) {
@@ -151,7 +168,7 @@ export function createToolSet(store: MemoryStore, config: Config): ToolSet {
       } = { targetId: args.targetId, sourceIds: args.sourceIds };
       if (args.text !== undefined) input.text = args.text;
       if (args.tags !== undefined) input.tags = normalizeTagsList(args.tags);
-      const record = store.merge(input);
+      const record = store.merge(input, readableScopes);
       return { record };
     },
   };

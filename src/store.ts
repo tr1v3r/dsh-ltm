@@ -314,20 +314,32 @@ export class MemoryStore implements MemoryStoreContract {
     });
   }
 
-  search(query: string, limit = 10, scope?: string): SearchResult[] {
+  search(
+    query: string,
+    limit = 10,
+    scope?: string | readonly string[],
+  ): SearchResult[] {
     const match = compileMatch(query);
     if (match === undefined) return [];
+    const scopes =
+      scope === undefined
+        ? undefined
+        : [...new Set(typeof scope === "string" ? [scope] : scope)];
+    if (scopes?.length === 0) return [];
     const capped = Math.max(1, Math.min(limit, this.#options.searchLimitMax));
+    const scopeClause =
+      scopes === undefined
+        ? ""
+        : `AND m.scope IN (${scopes.map(() => "?").join(", ")})`;
     const sql = `
       SELECT m.*, memories_fts.rank AS fts_rank
       FROM memories_fts JOIN memories m ON m.id = memories_fts.rowid
       WHERE memories_fts MATCH ?
-      ${scope === undefined ? "" : "AND m.scope = ?"}
+      ${scopeClause}
       ORDER BY memories_fts.rank
       LIMIT ?
     `;
-    const params: (string | number)[] =
-      scope === undefined ? [match, capped] : [match, scope, capped];
+    const params: (string | number)[] = [match, ...(scopes ?? []), capped];
     const rows = this.#db.prepare(sql).all(...params) as Row[];
     const hits: SearchResult[] = rows.map((row) => ({
       ...toRecord(row),
@@ -435,26 +447,42 @@ export class MemoryStore implements MemoryStoreContract {
     });
   }
 
-  forPrompt(recentCount: number): MemoryRecord[] {
+  forPrompt(recentCount: number, scopes?: readonly string[]): MemoryRecord[] {
+    const uniqueScopes = scopes === undefined ? undefined : [...new Set(scopes)];
+    if (uniqueScopes?.length === 0) return [];
+    const scopeClause =
+      uniqueScopes === undefined
+        ? ""
+        : `AND scope IN (${uniqueScopes.map(() => "?").join(", ")})`;
+    const params = uniqueScopes ?? [];
     const pinned = this.#db
-      .prepare("SELECT * FROM memories WHERE pinned = 1 ORDER BY updated_at DESC, id DESC")
-      .all() as Row[];
+      .prepare(
+        `SELECT * FROM memories WHERE pinned = 1 ${scopeClause}
+         ORDER BY updated_at DESC, id DESC`,
+      )
+      .all(...params) as Row[];
     const recent = this.#db
       .prepare(
-        "SELECT * FROM memories WHERE pinned = 0 ORDER BY updated_at DESC, id DESC LIMIT ?",
+        `SELECT * FROM memories WHERE pinned = 0 ${scopeClause}
+         ORDER BY updated_at DESC, id DESC LIMIT ?`,
       )
-      .all(recentCount) as Row[];
+      .all(...params, recentCount) as Row[];
     return [...pinned, ...recent].map(toRecord);
   }
 
   update(
     id: number,
     patch: { text?: string; tags?: readonly string[]; pinned?: boolean },
+    scopes?: readonly string[],
   ): MemoryRecord | undefined {
     const text = patch.text === undefined ? undefined : this.#validateText(patch.text, "update");
+    const allowed = scopes === undefined ? undefined : new Set(scopes);
+    if (allowed?.size === 0) return undefined;
     return this.#transaction(() => {
       const current = this.#get(id);
-      if (current === undefined) return undefined;
+      if (current === undefined || (allowed !== undefined && !allowed.has(current.scope))) {
+        return undefined;
+      }
       const next = {
         text: text ?? current.text,
         tags: patch.tags !== undefined ? normalizeTags(patch.tags) : current.tags,
@@ -473,38 +501,56 @@ export class MemoryStore implements MemoryStoreContract {
     });
   }
 
-  confirm(id: number | "*"): number {
+  confirm(id: number | "*", scopes?: readonly string[]): number {
+    const uniqueScopes = scopes === undefined ? undefined : [...new Set(scopes)];
+    if (uniqueScopes?.length === 0) return 0;
+    const scopeClause =
+      uniqueScopes === undefined
+        ? ""
+        : `scope IN (${uniqueScopes.map(() => "?").join(", ")})`;
     const now = this.#now();
     try {
       if (id === "*") {
+        const where = scopeClause.length === 0 ? "" : ` WHERE ${scopeClause}`;
         return Number(
           this.#db
-            .prepare("UPDATE memories SET last_confirmed_at = ?")
-            .run(now).changes,
+            .prepare(`UPDATE memories SET last_confirmed_at = ?${where}`)
+            .run(now, ...(uniqueScopes ?? [])).changes,
         );
       }
+      const scopeFilter = scopeClause.length === 0 ? "" : ` AND ${scopeClause}`;
       return Number(
         this.#db
-          .prepare("UPDATE memories SET last_confirmed_at = ? WHERE id = ?")
-          .run(now, id).changes,
+          .prepare(`UPDATE memories SET last_confirmed_at = ? WHERE id = ?${scopeFilter}`)
+          .run(now, id, ...(uniqueScopes ?? [])).changes,
       );
     } catch (error) {
       throw actionableSqliteError(error);
     }
   }
 
-  merge(input: MergeInput): MemoryRecord | undefined {
+  merge(input: MergeInput, scopes?: readonly string[]): MemoryRecord | undefined {
     const replacementText = input.text === undefined
       ? undefined
       : this.#validateText(input.text, "merge");
+    const allowed = scopes === undefined ? undefined : new Set(scopes);
+    if (allowed?.size === 0) return undefined;
     return this.#transaction(() => {
       const target = this.#get(input.targetId);
-      if (target === undefined) return undefined;
+      if (target === undefined || (allowed !== undefined && !allowed.has(target.scope))) {
+        return undefined;
+      }
       const sources: MemoryRecord[] = [];
       for (const sourceId of input.sourceIds) {
         const source = this.#get(sourceId);
         if (source === undefined) {
           throw new Error(`memory merge: source #${sourceId} does not exist`);
+        }
+        if (allowed !== undefined && !allowed.has(source.scope)) {
+          throw new Error(`memory merge: source #${sourceId} is outside the active project`);
+        }
+        if (source.scope !== target.scope) {
+          throw new Error("memory merge: cannot merge memories from different scopes");
         }
         if (sourceId === input.targetId) continue;
         sources.push(source);
@@ -538,10 +584,19 @@ export class MemoryStore implements MemoryStoreContract {
     });
   }
 
-  forget(id: number): boolean {
+  forget(id: number, scopes?: readonly string[]): boolean {
+    const uniqueScopes = scopes === undefined ? undefined : [...new Set(scopes)];
+    if (uniqueScopes?.length === 0) return false;
+    const scopeFilter =
+      uniqueScopes === undefined
+        ? ""
+        : ` AND scope IN (${uniqueScopes.map(() => "?").join(", ")})`;
     return this.#transaction(() => {
-      const deleted =
-        Number(this.#db.prepare("DELETE FROM memories WHERE id = ?").run(id).changes) > 0;
+      const deleted = Number(
+        this.#db
+          .prepare(`DELETE FROM memories WHERE id = ?${scopeFilter}`)
+          .run(id, ...(uniqueScopes ?? [])).changes,
+      ) > 0;
       if (deleted) this.#deleteFts(id);
       return deleted;
     });
