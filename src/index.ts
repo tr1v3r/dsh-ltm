@@ -6,7 +6,7 @@
  * @module dsh-ltm
  */
 
-import { defineTool } from "@deepseek-ai/dsh-tools";
+import { defineTool, type ToolRunContext } from "@deepseek-ai/dsh-tools";
 import type { Context } from "@deepseek-ai/cordis";
 import { loadConfig } from "./config.js";
 import { MemoryStore } from "./store.js";
@@ -19,6 +19,11 @@ import {
   type WriteToolOutput,
 } from "./tools.js";
 import { promptLine, renderPrompt } from "./prompt.js";
+import {
+  cwdFromAgentScope,
+  resolveProjectScope,
+  visibleScopes,
+} from "./scope.js";
 
 export const name = "ltm";
 export const inject = ["tools", "systemPrompt"];
@@ -27,17 +32,17 @@ export { Config } from "./config.js";
 const WRITE_DESCRIPTION =
   "Remember one durable fact across sessions: a user preference, a project convention, a decision and its reason, or a hard-won detail about this codebase. Write one self-contained fact per call — it will be read back with no surrounding conversation. Do NOT store transient task state (use the todo list), secrets, or anything the repository already records. Near-duplicates are detected on write; if similar memories come back, merge them or re-send with force: true.";
 const SEARCH_DESCRIPTION =
-  "Search stored memories by keyword (CJK-aware tokenization, hybrid rerank). Pinned and recent memories already appear in your context, so search when you need something older or more specific than what you can already see.";
+  "Search global and current-project memories by keyword (CJK-aware tokenization, hybrid rerank). Pinned and recent memories already appear in your context, so search when you need something older or more specific than what you can already see.";
 const FORGET_DESCRIPTION =
-  "Delete one stored memory by id, for a fact that is now wrong or obsolete. Ids come from memory_search or memory_write.";
+  "Delete one visible global/current-project memory by id, for a fact that is now wrong or obsolete. Ids come from memory_search or memory_write.";
 const UPDATE_DESCRIPTION =
-  "Revise an existing memory's text/tags/pinned in place, keeping its id. Prefer this over delete-and-rewrite so id references in the conversation stay valid.";
+  "Revise a visible global/current-project memory's text/tags/pinned in place, keeping its id. Prefer this over delete-and-rewrite so id references in the conversation stay valid.";
 const CONFIRM_DESCRIPTION =
-  'Confirm one memory is still accurate (refreshes its review timestamp, clears the stale flag). Pass id: "*" to confirm every stored memory.';
+  'Confirm one visible memory is still accurate (refreshes its review timestamp, clears the stale flag). Pass id: "*" to confirm all global/current-project memories.';
 const LIST_DESCRIPTION =
-  "Browse stored memories filtered by scope, tags (AND semantics), staleness, or pinned state.";
+  "Explicitly browse memories across projects, filtered by scope, tags (AND semantics), staleness, or pinned state.";
 const MERGE_DESCRIPTION =
-  "Merge near-duplicate memories into one surviving record: sources are absorbed into the target and deleted; tags default to the union of all merged records.";
+  "Merge near-duplicate memories from one visible scope into one surviving record: sources are absorbed into the target and deleted; tags default to the union of all merged records.";
 
 /**
  * Open the store, register the tools, contribute the section.
@@ -72,22 +77,42 @@ export function apply(ctx: Context, rawConfig: unknown) {
     return store;
   }
 
-  const tools = createToolSet(
-    new Proxy({} as MemoryStore, {
-      get(_target, prop, receiver) {
-        const target = open() as unknown as Record<string | symbol, unknown>;
-        const value = Reflect.get(target, prop, receiver);
-        return typeof value === "function" ? value.bind(target) : value;
-      },
-    }),
-    config,
-  );
+  const storeProxy = new Proxy({} as MemoryStore, {
+    get(_target, prop, receiver) {
+      const target = open() as unknown as Record<string | symbol, unknown>;
+      const value = Reflect.get(target, prop, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+
+  function activeScope(scope: object | undefined): string {
+    if (!config.autoProjectScope) return config.defaultScope;
+    return resolveProjectScope(
+      cwdFromAgentScope(scope),
+      config.defaultScope,
+    ).scope;
+  }
+
+  function toolsFor(exec: ToolRunContext) {
+    return createToolSet(storeProxy, config, {
+      activeScope: activeScope(exec.agent),
+      includeGlobal: config.autoProjectScope,
+    });
+  }
 
   ctx.systemPrompt.section({
     name: "ltm:recall",
     order: config.promptOrder,
-    // Always read through the fiber-scoped store, never a captured handle.
-    text: () => renderPrompt(open().forPrompt(config.promptRecentCount), config),
+    // Assembly scope is the current agent, so concurrent Web sessions do not
+    // share the process cwd or leak pinned/recent memories across projects.
+    text: (assembly) => {
+      const scope = activeScope(assembly.scope);
+      const scopes = visibleScopes(scope, config.autoProjectScope);
+      return renderPrompt(
+        open().forPrompt(config.promptRecentCount, scopes),
+        config,
+      );
+    },
   });
 
   ctx.tools.register(
@@ -135,8 +160,8 @@ export function apply(ctx: Context, rawConfig: unknown) {
         kind: "edit",
         rawInput: args,
       }),
-      async execute(args) {
-        const { record, dedupeHits } = tools.memory_write(args);
+      async execute(args, exec) {
+        const { record, dedupeHits } = toolsFor(exec).memory_write(args);
         return serializers.write({ record, dedupeHits });
       },
     }),
@@ -191,8 +216,8 @@ export function apply(ctx: Context, rawConfig: unknown) {
         title: `memory_search ${args.query}`,
         kind: "search",
       }),
-      async execute(args) {
-        return serializers.search(tools.memory_search(args));
+      async execute(args, exec) {
+        return serializers.search(toolsFor(exec).memory_search(args));
       },
     }),
   );
@@ -226,8 +251,8 @@ export function apply(ctx: Context, rawConfig: unknown) {
           },
         ],
       },
-      async execute(args) {
-        const { deleted } = tools.memory_forget(args);
+      async execute(args, exec) {
+        const { deleted } = toolsFor(exec).memory_forget(args);
         return { id: args.id, deleted };
       },
     }),
@@ -265,8 +290,8 @@ export function apply(ctx: Context, rawConfig: unknown) {
           },
         ],
       },
-      async execute(args) {
-        const { record } = tools.memory_update(args);
+      async execute(args, exec) {
+        const { record } = toolsFor(exec).memory_update(args);
         return { updated: record !== undefined, id: args.id };
       },
     }),
@@ -295,12 +320,12 @@ export function apply(ctx: Context, rawConfig: unknown) {
           { type: "text", text: `Confirmed ${value.confirmed} memory(ies).` },
         ],
       },
-      async execute(args) {
+      async execute(args, exec) {
         const id = args.id === "*" ? "*" : Number(args.id);
         if (id !== "*" && !Number.isInteger(id)) {
           throw new Error('memory_confirm: `id` must be an integer or "*"');
         }
-        return tools.memory_confirm({ id });
+        return toolsFor(exec).memory_confirm({ id });
       },
     }),
   );
@@ -351,8 +376,8 @@ export function apply(ctx: Context, rawConfig: unknown) {
           },
         ],
       },
-      async execute(args) {
-        const { records } = tools.memory_list(args);
+      async execute(args, exec) {
+        const { records } = toolsFor(exec).memory_list(args);
         return {
           records: records.map((record) => serializers.record(record)!),
         };
@@ -401,8 +426,8 @@ export function apply(ctx: Context, rawConfig: unknown) {
           },
         ],
       },
-      async execute(args) {
-        const { record } = tools.memory_merge(args);
+      async execute(args, exec) {
+        const { record } = toolsFor(exec).memory_merge(args);
         return { merged: record !== undefined, targetId: args.targetId };
       },
     }),

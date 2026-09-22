@@ -193,6 +193,18 @@ describe("MemoryStore basics", () => {
     expect(records).toHaveLength(2);
   });
 
+  it("forPrompt limits recall to global plus the active project", () => {
+    const store = open();
+    store.write("global pinned", [], { pinned: true });
+    store.write("project a pinned", [], { scope: "project-a", pinned: true });
+    store.write("project b recent", [], { scope: "project-b" });
+    const records = store.forPrompt(5, ["", "project-a"]);
+    expect(records.map((record) => record.text)).toEqual([
+      "project a pinned",
+      "global pinned",
+    ]);
+  });
+
   it("list filters by scope, tags (AND), and pinned", () => {
     const store = open();
     store.write("a", ["x", "y"], { scope: "work" });
@@ -331,12 +343,16 @@ describe("CJK search (R2)", () => {
     expect(store.search('"OR"')).toHaveLength(1);
   });
 
-  it("search can be scoped", () => {
+  it("search can be limited to one or more scopes", () => {
     const store = open();
+    store.write("vim keys", [], { scope: "" });
     store.write("vim keys", [], { scope: "tui" });
     store.write("vim keys", [], { scope: "web" });
     expect(store.search("vim", 10, "web")).toHaveLength(1);
     expect(store.search("vim", 10, "web")[0]!.scope).toBe("web");
+    expect(store.search("vim", 10, ["", "web"]).map((hit) => hit.scope).sort())
+      .toEqual(["", "web"]);
+    expect(store.search("vim", 10, [])).toEqual([]);
   });
 });
 
