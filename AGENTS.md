@@ -90,6 +90,12 @@ seam; version 0.1 uses only BM25 plus character n-gram cosine reranking.
 
 ## Git and Release
 
+Agent-executed tasks must not modify the working tree directly. Before making
+any change, create a dedicated git worktree under the `.git` directory (e.g.
+`git worktree add .git/worktrees/<task> -b <task-branch>`) and do all work
+there; apply results back via branch/merge or patch instead of editing the
+main checkout in place.
+
 Use Conventional Commits. CI tests Node 22 and 24 and validates packed-file
 contents. Publishing is manual/tag-gated through npm Trusted Publishing. Do not
 commit npm tokens, local databases, build output, caches, or files under
