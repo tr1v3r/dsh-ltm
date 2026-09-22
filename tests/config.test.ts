@@ -18,7 +18,7 @@ describe("escapeForPrompt", () => {
 
   it("fully escapes a nested {{{{ run leaving no raw sequence", () => {
     // Two naive non-overlapping replacements would yield `{{{{` -> `{<ZWSP>{{<ZWSP>{`,
-    // whose middle two braces are again a raw `{{` (a template-injection bypass).
+    // whose middle two braces are again a configured raw sequence.
     // Every brace must be separated so the result contains no raw `{{`.
     const out = escapeForPrompt("{{{{", ["{{"]);
     expect(out).toBe(`{${ZWSP}{${ZWSP}{${ZWSP}{`);
@@ -60,7 +60,7 @@ describe("escapeForPrompt", () => {
 describe("loadConfig", () => {
   it("fills every default", () => {
     const config = loadConfig({ path: "/tmp/x.db" });
-    expect(config.escapeSequences).toEqual(["{{"]);
+    expect(config.escapeSequences).toEqual([]);
     expect(config.dedupeThreshold).toBe(0.8);
     expect(config.staleAfterDays).toBe(90);
     expect(config.promptRecentCount).toBe(10);

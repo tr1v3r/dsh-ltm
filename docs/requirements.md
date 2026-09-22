@@ -21,7 +21,7 @@
 | R6 跨项目聚合 | scope/tag 聚合视图 | `memory_list` 无 scope 时返回全部并按 scope 排序分组；tag 过滤 AND 语义（单测） |
 | R7 CLI 管理 | `list/search/show/edit/tag/pin/merge/confirm/export/import/migrate` | 每个子命令 JSON（`--json`）与人类双输出；`--db` 指定库路径；未知/互斥 flag 与多余位置参数 fail-loud；export/import 保持完整记录状态并验证格式与 ID 冲突（集成测试） |
 | R8 自动迁移 | 旧 `~/.config/dsh/memory/memory.db` → 新 schema | 对真实旧库拷贝跑 `migrate`：`MigrationReport.migratedCount == sourceCount`，原库文件字节不变（迁移后 sha256 对比），pinned 记忆迁移后可检索 |
-| R9 提示词安全 | pinned 优先 + 字符预算 + `{{` 转义内置 | `escapeSequences` 默认 `['{{']`，渲染前替换为 `{\u200b{`；嵌套 `{{{{` 与文本自带零宽空格的边界有单测；config 非法值（如 threshold∉[0,1]）load 即抛 |
+| R9 提示词渲染 | pinned 优先 + 字符预算 + 默认保持原文 | `escapeSequences` 默认 `[]`，模板式文本原样渲染；显式配置定界符时才以零宽空格打断，且嵌套序列与文本自带零宽空格的边界有单测；config 非法值（如 threshold∉[0,1]）load 即抛 |
 | R10 发布 | GitHub + npm | CI tag 门控发布（参照 dsh-quote-followup）；**push/publish 前需用户本人确认**；`main` 分支保护：只能经 PR 合并，必检 `test (22)`/`test (24)`/`pack` 全绿且分支最新，禁强推与删分支，管理员不豁免（见 `docs/integration.md` §1） |
 
 ## 3. 工具集契约（§4 定稿）
