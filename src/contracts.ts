@@ -197,6 +197,11 @@ export interface EmbeddingAdapter {
 // Plugin surface
 // ---------------------------------------------------------------------------
 
+/** Synchronous, deterministic count of a complete section; never additive.
+ * Independent of retrieval's Tokenizer. Must return a nonnegative safe integer.
+ */
+export type TokenCounter = (text: string) => number;
+
 /** Plugin config (schemastery-validated, fail-loud on invalid values). */
 export interface Config {
   /** SQLite file for this deployment's memories, or `:memory:`. Required. */
@@ -211,6 +216,10 @@ export interface Config {
   promptRecentCount: number;
   /** Character budget of the rendered section; pinned survive first. */
   promptMaxChars: number;
+  /** Optional hard token cap in addition to promptMaxChars; absent = char-only. */
+  promptMaxTokens?: number;
+  /** Local supported Hugging Face tokenizer.json; required with promptMaxTokens. */
+  promptTokenizerPath?: string;
   /** Maximum characters accepted for one memory. */
   maxTextChars: number;
   /** Default `limit` for `memory_search` when the model omits it. */

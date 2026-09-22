@@ -19,6 +19,9 @@ import {
   type WriteToolOutput,
 } from "./tools.js";
 import { promptLine, renderPrompt } from "./prompt.js";
+import { loadTokenCounter } from "./token-counter.js";
+export { loadTokenCounter } from "./token-counter.js";
+export type { TokenCounter } from "./contracts.js";
 import {
   cwdFromAgentScope,
   resolveProjectScope,
@@ -52,6 +55,10 @@ const MERGE_DESCRIPTION =
  */
 export function apply(ctx: Context, rawConfig: unknown) {
   const config = loadConfig(rawConfig);
+  // Fail before opening SQLite or registering any effects/tools. Default mode
+  // never resolves/imports the optional tokenizer dependency.
+  const tokenCounter = config.promptTokenizerPath === undefined
+    ? undefined : loadTokenCounter(config.promptTokenizerPath);
   let store: MemoryStore | undefined;
   ctx.effect(() => {
     store = new MemoryStore(config.path, {
@@ -93,9 +100,9 @@ export function apply(ctx: Context, rawConfig: unknown) {
     ).scope;
   }
 
-  function toolsFor(exec: ToolRunContext) {
+  function toolsFor(exec: ToolRunContext | undefined) {
     return createToolSet(storeProxy, config, {
-      activeScope: activeScope(exec.agent),
+      activeScope: activeScope(exec?.agent),
       includeGlobal: config.autoProjectScope,
     });
   }
@@ -105,12 +112,14 @@ export function apply(ctx: Context, rawConfig: unknown) {
     order: config.promptOrder,
     // Assembly scope is the current agent, so concurrent Web sessions do not
     // share the process cwd or leak pinned/recent memories across projects.
+    // Always read through the fiber-scoped store, never a captured handle.
     text: (assembly) => {
-      const scope = activeScope(assembly.scope);
+      const scope = activeScope(assembly?.scope);
       const scopes = visibleScopes(scope, config.autoProjectScope);
       return renderPrompt(
         open().forPrompt(config.promptRecentCount, scopes),
         config,
+        tokenCounter,
       );
     },
   });

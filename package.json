@@ -52,5 +52,8 @@
     "tsdown": "^0.15.6",
     "typescript": "^5.9.3",
     "vitest": "^3.2.4"
+  },
+  "optionalDependencies": {
+    "@huggingface/tokenizers": "0.2.0"
   }
 }
