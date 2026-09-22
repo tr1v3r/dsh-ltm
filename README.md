@@ -61,6 +61,8 @@ New:
 
 Near-duplicate detection scans all memories in the same scope on each non-forced `memory_write`. This design targets personal long-term fact stores rather than large document collections. Write cost grows with the number and length of memories in that scope; no benchmark-backed capacity limit is currently documented.
 
+Multiple sessions on one personal PC or server can share a local WAL database. Opening an initialized, compatible store with current FTS tokens does not take the schema writer lock; first initialization, schema repair, and token-index rebuilds still require writes. SQLite still serializes writers with a 5-second busy timeout. A `SQLITE_BUSY` error asks you to retry later; there is no automatic application retry. Dedupe remains inside the write transaction, so its full-scope scan can hold the writer lock longer as the store grows. This is not a high-concurrency service or cross-machine database synchronization.
+
 ## CLI
 
 ```sh

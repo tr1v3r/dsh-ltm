@@ -61,6 +61,25 @@ export const DEFAULT_STORE_OPTIONS: StoreOptions = {
 
 type Row = Record<string, unknown>;
 
+class StoreBusyError extends Error {}
+
+/** Node reports SQLITE_BUSY as ERR_SQLITE_ERROR with numeric errcode 5. */
+function actionableSqliteError(error: unknown): unknown {
+  if (error instanceof StoreBusyError || !(error instanceof Error)) return error;
+  const sqlite = error as Error & { code?: string; errcode?: number; errstr?: string };
+  if (sqlite.code !== "SQLITE_BUSY" &&
+      !(typeof sqlite.errcode === "number" && (sqlite.errcode & 0xff) === 5)) return error;
+  const wrapped = new StoreBusyError(
+    "dsh-ltm: database is busy (SQLITE_BUSY); another connection may be writing. Retry the operation later.",
+    { cause: error },
+  );
+  // Keep the driver's identifiers, including extended SQLite result codes.
+  for (const key of ["code", "errcode", "errstr"] as const) {
+    if (sqlite[key] !== undefined) Object.assign(wrapped, { [key]: sqlite[key] });
+  }
+  return wrapped;
+}
+
 function toRecord(row: Row): MemoryRecord {
   return {
     id: row.id as number,
@@ -105,17 +124,18 @@ export class MemoryStore implements MemoryStoreContract {
     // refusal. A read-only connection leaves the main file and `-wal` alone
     // (`-shm`, SQLite's shared-memory coordination file, may be created or
     // updated even then).
-    if (path !== ":memory:" && existsSync(path)) {
-      const probe = new DatabaseSync(path, { readOnly: true });
-      try {
-        assertSchemaCompatible(probe);
-      } finally {
-        probe.close();
-      }
-    }
-
-    this.#db = new DatabaseSync(path, { timeout: 5000 });
+    let db: DatabaseSync | undefined;
     try {
+      if (path !== ":memory:" && existsSync(path)) {
+        const probe = new DatabaseSync(path, { readOnly: true });
+        try {
+          assertSchemaCompatible(probe);
+        } finally {
+          probe.close();
+        }
+      }
+
+      db = this.#db = new DatabaseSync(path, { timeout: 5000 });
       this.#db.exec("PRAGMA journal_mode = WAL");
       this.#db.exec("PRAGMA busy_timeout = 5000");
       this.#db.exec("PRAGMA foreign_keys = ON");
@@ -124,9 +144,13 @@ export class MemoryStore implements MemoryStoreContract {
       ensureSchema(this.#db);
       this.#ensureFtsTokenVersion();
     } catch (error) {
-      this.#db.close();
+      try {
+        db?.close();
+      } catch {
+        // Preserve the open/initialization failure if cleanup also fails.
+      }
       this.#closed = true;
-      throw error;
+      throw actionableSqliteError(error);
     }
   }
 
@@ -160,18 +184,22 @@ export class MemoryStore implements MemoryStoreContract {
 
   /** Run `fn` inside one transaction; FTS rows always commit with the base rows. */
   #transaction<T>(fn: () => T): T {
-    this.#db.exec("BEGIN IMMEDIATE");
+    let begun = false;
     try {
+      this.#db.exec("BEGIN IMMEDIATE");
+      begun = true;
       const result = fn();
       this.#db.exec("COMMIT");
       return result;
     } catch (error) {
-      try {
-        this.#db.exec("ROLLBACK");
-      } catch {
-        // connection already failed the transaction; surface the original error
+      if (begun) {
+        try {
+          this.#db.exec("ROLLBACK");
+        } catch {
+          // connection already failed the transaction; surface the original error
+        }
       }
-      throw error;
+      throw actionableSqliteError(error);
     }
   }
 
@@ -447,18 +475,22 @@ export class MemoryStore implements MemoryStoreContract {
 
   confirm(id: number | "*"): number {
     const now = this.#now();
-    if (id === "*") {
+    try {
+      if (id === "*") {
+        return Number(
+          this.#db
+            .prepare("UPDATE memories SET last_confirmed_at = ?")
+            .run(now).changes,
+        );
+      }
       return Number(
         this.#db
-          .prepare("UPDATE memories SET last_confirmed_at = ?")
-          .run(now).changes,
+          .prepare("UPDATE memories SET last_confirmed_at = ? WHERE id = ?")
+          .run(now, id).changes,
       );
+    } catch (error) {
+      throw actionableSqliteError(error);
     }
-    return Number(
-      this.#db
-        .prepare("UPDATE memories SET last_confirmed_at = ? WHERE id = ?")
-        .run(now, id).changes,
-    );
   }
 
   merge(input: MergeInput): MemoryRecord | undefined {
