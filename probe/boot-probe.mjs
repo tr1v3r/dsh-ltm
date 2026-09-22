@@ -153,6 +153,25 @@ const otherLtmSection = otherAssembly.sections.find((s) => s.name === "ltm:recal
 check("primary prompt excludes second project", !ltmSection?.text.includes("qzjxv"));
 check("second prompt recalls its own project", !!otherLtmSection?.text.includes("qzjxv"));
 
+// 5. Actual registry serializer/schema/render retain optional budget metadata.
+const pinnedResult = await executeCall("memory_write", {
+  text: "Budget probe unique durable convention zbxkq.", pinned: true, force: true,
+});
+const pinnedId = pinnedResult.value.record.id;
+check("pinned write passes registry schema with budget",
+  pinnedResult.value.budget?.selectedIds.includes(pinnedId));
+check("pinned write renders budget", pinnedResult.content.some((block) => block.type === "text" && block.text.includes("Recall budget:")));
+check("budget excludes foreign project", !pinnedResult.value.budget?.selectedIds.includes(otherId));
+for (const patch of [{ tags: ["budget-updated"] }, { text: "Budget probe revised durable convention zbxkq." }, { pinned: false }]) {
+  const result = await executeCall("memory_update", { id: pinnedId, ...patch });
+  check(`update budget passes registry schema: ${Object.keys(patch)[0]}`, result.value.updated && result.value.budget !== undefined);
+  check(`update budget rendered: ${Object.keys(patch)[0]}`, result.content.some((block) => block.type === "text" && block.text.includes("Recall budget:")));
+}
+const missingUpdate = await call("memory_update", { id: 999999, pinned: true });
+check("missing update omits budget", !missingUpdate.updated && missingUpdate.budget === undefined);
+check("ordinary write omits budget", w2.budget === undefined);
+check("blocked write omits budget", dup.budget === undefined);
+
 await ctx.fiber.dispose();
 rmSync(isolatedDir, { recursive: true, force: true });
 console.log(failures.length === 0 ? "\nALL PROBE CHECKS PASSED" : `\n${failures.length} FAILURE(S): ${failures.join(", ")}`);

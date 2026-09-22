@@ -55,8 +55,11 @@ export function ngramCounts(text: string): Map<string, number> {
 
 /** Cosine similarity between two texts via char n-gram frequency vectors. */
 export function ngramCosine(a: string, b: string): number {
-  const va = ngramCounts(a);
-  const vb = ngramCounts(b);
+  return ngramVectorCosine(ngramCounts(a), ngramCounts(b));
+}
+
+/** Compare cached derived vectors; equivalent to ngramCosine without retokenizing. */
+export function ngramVectorCosine(va: ReadonlyMap<string, number>, vb: ReadonlyMap<string, number>): number {
   if (va.size === 0 || vb.size === 0) return 0;
   let dot = 0;
   let na = 0;
