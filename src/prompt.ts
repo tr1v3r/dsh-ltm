@@ -9,7 +9,7 @@
  * @module dsh-ltm/prompt
  */
 
-import type { Config, MemoryRecord, MemoryStore, TokenCounter } from "./contracts.js";
+import type { Config, MemoryRecord, MemoryStore, TokenCounter, PromptRenderResult, PromptBudgetReport } from "./contracts.js";
 import { validateTokenBudget } from "./token-counter.js";
 import { escapeForPrompt } from "./config.js";
 import { isStale } from "./expire.js";
@@ -79,6 +79,7 @@ function truncateToUnits(line: string, room: number): string {
 /** One rendered line plus whether it came from a pinned record, and the
  * `- (#id` prefix that makes the record identifiable when truncated. */
 interface RenderedLine {
+  id: number;
   line: string;
   pinned: boolean;
   identity: string;
@@ -101,18 +102,20 @@ interface RenderedLine {
  * @param config - prompt rendering knobs (`promptMaxChars`, `escapeSequences`).
  * @returns the section text, or `""` when nothing fits or nothing is stored.
  */
-export function renderPrompt(
+export function renderPromptResult(
   records: readonly MemoryRecord[],
   config: Pick<Config, "promptMaxChars" | "escapeSequences" | "staleAfterDays" | "promptMaxTokens">,
   tokenCounter?: TokenCounter,
-): string {
+): PromptRenderResult {
+  const finish = selectionResult(records);
   validateTokenBudget(config.promptMaxTokens, tokenCounter);
   if (config.promptMaxTokens !== undefined) {
     return renderTokenBounded(records, config, tokenCounter!, config.promptMaxTokens);
   }
-  if (records.length === 0) return "";
+  if (records.length === 0) return finish("");
   const budget = config.promptMaxChars;
   const render = (record: MemoryRecord): RenderedLine => ({
+    id: record.id,
     line: promptLine(record, config.escapeSequences, config.staleAfterDays),
     pinned: record.pinned,
     identity: `- (#${record.id}`,
@@ -165,22 +168,22 @@ export function renderPrompt(
   if (kept.length === 0 && pinnedLines.length > 0) {
     const first = pinnedLines[0]!;
     const bodyBudget = budget - HEADER.length - TRUNCATION_MARKER.length;
-    if (bodyBudget < 0) return "";
+    if (bodyBudget < 0) return finish("");
     const notice = omissionNotice(records.length - 1);
     if (notice.length > 0 && bodyBudget - notice.length > 0) {
       const body = truncateToUnits(first.line, bodyBudget - notice.length);
       // Keep the notice only when the pinned record stays identifiable
       // (`- (#id` survives the truncation).
-      if (body.includes(first.identity)) {
-        return HEADER + body + TRUNCATION_MARKER + notice;
+      if (body.length >= first.identity.length) {
+        return finish(HEADER + body + TRUNCATION_MARKER + notice, [first], [first.id]);
       }
     }
-    return (
-      HEADER + truncateToUnits(first.line, bodyBudget) + TRUNCATION_MARKER
-    );
+    const body = truncateToUnits(first.line, bodyBudget);
+    // Track the actual source even when a tiny legacy budget cuts its id prefix.
+    return finish(HEADER + body + TRUNCATION_MARKER, body.length > 0 ? [first] : [], body.length > 0 ? [first.id] : []);
   }
 
-  if (kept.length === 0) return "";
+  if (kept.length === 0) return finish("");
 
   // The omission notice competes for the budget. Evict disposable recent lines
   // only — never a pinned one — and, if even that is not enough, drop the
@@ -189,7 +192,7 @@ export function renderPrompt(
   for (;;) {
     const tail = omissionNotice(omitted);
     if (used + tail.length <= budget) {
-      return HEADER + kept.map((entry) => entry.line).join("\n") + tail;
+      return finish(HEADER + kept.map((entry) => entry.line).join("\n") + tail, kept);
     }
     const last = kept[kept.length - 1];
     if (last !== undefined && !last.pinned) {
@@ -198,8 +201,44 @@ export function renderPrompt(
       omitted++;
       continue;
     }
-    return HEADER + kept.map((entry) => entry.line).join("\n");
+    return finish(HEADER + kept.map((entry) => entry.line).join("\n"), kept);
   }
+}
+
+type PromptConfig = Pick<Config, "promptMaxChars" | "escapeSequences" | "staleAfterDays" | "promptMaxTokens">;
+
+function selectionResult(records: readonly MemoryRecord[]) {
+  return (text: string, entries: readonly RenderedLine[] = [], truncatedIds: number[] = []): PromptRenderResult => {
+    const selectedIds = entries.map((entry) => entry.id);
+    const selected = new Set(selectedIds);
+    return { text, selectedIds, truncatedIds, omittedIds: records.filter((r) => !selected.has(r.id)).map((r) => r.id) };
+  };
+}
+
+/** Compatibility text surface backed by the structural selection algorithm. */
+export function renderPrompt(records: readonly MemoryRecord[], config: PromptConfig, tokenCounter?: TokenCounter): string {
+  return renderPromptResult(records, config, tokenCounter).text;
+}
+
+/** Budget snapshot for supplied visible prompt records; does not read or mutate the store. */
+export function promptBudgetReport(records: readonly MemoryRecord[], config: PromptConfig, tokenCounter?: TokenCounter): PromptBudgetReport {
+  const result = renderPromptResult(records, config, tokenCounter);
+  const pinned = new Set(records.filter((r) => r.pinned).map((r) => r.id));
+  const report: PromptBudgetReport = {
+    selectedIds: result.selectedIds, truncatedIds: result.truncatedIds, omittedIds: result.omittedIds,
+    chars: result.text.length, maxChars: config.promptMaxChars,
+    pinnedCount: pinned.size,
+    selectedPinnedCount: result.selectedIds.filter((id) => pinned.has(id)).length,
+    omittedPinnedIds: result.omittedIds.filter((id) => pinned.has(id)),
+    truncatedPinnedIds: result.truncatedIds.filter((id) => pinned.has(id)),
+  };
+  if (config.promptMaxTokens !== undefined) {
+    const tokens = tokenCounter!(result.text);
+    if (!Number.isSafeInteger(tokens) || tokens < 0) throw new Error("ltm: TokenCounter must return a nonnegative safe integer");
+    report.tokens = tokens;
+    report.maxTokens = config.promptMaxTokens;
+  }
+  return report;
 }
 
 /**
@@ -224,15 +263,17 @@ function renderTokenBounded(
   config: Pick<Config, "promptMaxChars" | "escapeSequences" | "staleAfterDays">,
   count: TokenCounter,
   maxTokens: number,
-): string {
+): PromptRenderResult {
+  const finish = selectionResult(records);
   const fits = (text: string): boolean => {
     if (text.length > config.promptMaxChars) return false;
     const tokens = count(text);
     if (!Number.isSafeInteger(tokens) || tokens < 0) throw new Error("ltm: TokenCounter must return a nonnegative safe integer");
     return tokens <= maxTokens;
   };
-  if (records.length === 0) return "";
+  if (records.length === 0) return finish("");
   const render = (record: MemoryRecord): RenderedLine => ({
+    id: record.id,
     line: promptLine(record, config.escapeSequences, config.staleAfterDays),
     pinned: record.pinned,
     identity: `- (#${record.id}`,
@@ -262,23 +303,23 @@ function renderTokenBounded(
       const candidate = HEADER + prefix + TRUNCATION_MARKER;
       if (fits(candidate)) {
         const withNotice = candidate + omissionNotice(records.length - 1);
-        return fits(withNotice) ? withNotice : candidate;
+        return finish(fits(withNotice) ? withNotice : candidate, [first], [first.id]);
       }
       const last = prefix.charCodeAt(prefix.length - 1);
       prefix = prefix.slice(0, prefix.length - (last >= 0xdc00 && last <= 0xdfff ? 2 : 1));
     }
     // Impossible budget: hard caps win over the first-pinned fallback.
-    return "";
+    return finish("");
   }
-  if (kept.length === 0) return "";
+  if (kept.length === 0) return finish("");
   for (;;) {
     const body = section(kept);
     const candidate = body + omissionNotice(omitted);
-    if (fits(candidate)) return candidate;
+    if (fits(candidate)) return finish(candidate, kept);
     const last = kept[kept.length - 1];
-    if (!last || last.pinned) return body; // already measured; never evict pinned for notice
+    if (!last || last.pinned) return finish(body, kept); // already measured; never evict pinned for notice
     kept.pop();
     omitted++;
-    if (kept.length === 0) return "";
+    if (kept.length === 0) return finish("");
   }
 }

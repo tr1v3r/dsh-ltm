@@ -236,6 +236,35 @@ export interface Config {
   staleAfterDays: number;
 }
 
+/** Structural recall selection; ids come from records, never rendered prose. */
+export interface PromptRenderResult {
+  text: string;
+  selectedIds: number[];
+  truncatedIds: number[];
+  omittedIds: number[];
+}
+
+/** Advisory post-write snapshot of the actual visible recall budget. */
+export interface PromptBudgetReport {
+  selectedIds: number[];
+  truncatedIds: number[];
+  omittedIds: number[];
+  chars: number;
+  maxChars: number;
+  tokens?: number;
+  maxTokens?: number;
+  pinnedCount: number;
+  selectedPinnedCount: number;
+  omittedPinnedIds: number[];
+  truncatedPinnedIds: number[];
+}
+
+export interface BudgetFeedback {
+  budget?: PromptBudgetReport;
+  /** Persistence succeeded, but advisory budget computation was unavailable. */
+  budgetWarning?: string;
+}
+
 /** The seven model-facing tools (§4). Semantics normative. */
 export interface ToolSet {
   /** Legacy-compatible; returns dedupe hits when not forcing. */
@@ -244,7 +273,7 @@ export interface ToolSet {
     tags?: string[];
     pinned?: boolean;
     force?: boolean;
-  }): { record: MemoryRecord; dedupeHits: DedupeHit[] };
+  }): { record: MemoryRecord; dedupeHits: DedupeHit[] } & BudgetFeedback;
   /** Legacy-compatible; ranked results. */
   memory_search(args: { query: string; limit?: number }): { results: SearchResult[] };
   /** Legacy-compatible delete. */
@@ -255,7 +284,7 @@ export interface ToolSet {
     text?: string;
     tags?: string[];
     pinned?: boolean;
-  }): { record: MemoryRecord | undefined };
+  }): { record: MemoryRecord | undefined } & BudgetFeedback;
   /** Refresh lastConfirmedAt, clear stale; `id: "*"` refreshes all. */
   memory_confirm(args: { id: number | "*" }): { confirmed: number };
   /** Browse by scope/tag/stale/pinned. */

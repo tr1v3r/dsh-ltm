@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -30,6 +30,55 @@ beforeEach(() => {
 afterEach(() => {
   store.close();
   rmSync(dir, { recursive: true, force: true });
+});
+
+describe("optional recall budget feedback", () => {
+  it("uses global plus active visibility; fixed scope excludes global", () => {
+    const global = store.write("global", [], { pinned: true, scope: "", force: true }).record;
+    store.write("foreign", [], { pinned: true, scope: "foreign", force: true });
+    const cfg = { ...config, defaultScope: "active", autoProjectScope: true };
+    const tools = createToolSet(store, cfg, { activeScope: "active", includeGlobal: true });
+    const write = tools.memory_write({ text: "active", pinned: true, force: true });
+    expect(write.budget?.selectedIds).toEqual(expect.arrayContaining([global.id, write.record.id]));
+    expect(write.budget?.pinnedCount).toBe(2);
+    expect(serializers.write(write).budget).toEqual(write.budget);
+    const fixed = createToolSet(store, { ...cfg, autoProjectScope: false });
+    expect(fixed.memory_update({ id: write.record.id, tags: ["new"] }).budget?.pinnedCount).toBe(1);
+    expect(tools.memory_update({ id: write.record.id, text: "revised" }).budget).toBeDefined();
+    expect(tools.memory_update({ id: write.record.id, pinned: false }).budget?.pinnedCount).toBe(1);
+    expect(tools.memory_update({ id: write.record.id, tags: ["unpinned"] }).budget).toBeUndefined();
+    expect(tools.memory_update({ id: 9999, pinned: true }).budget).toBeUndefined();
+  });
+  it("does not attach metadata to unpinned or dedupe-blocked writes", () => {
+    const tools = createToolSet(store, config);
+    expect(tools.memory_write({ text: "fact" }).budget).toBeUndefined();
+    const blocked = tools.memory_write({ text: "fact", pinned: true });
+    expect(blocked.dedupeHits.length).toBeGreaterThan(0);
+    expect(blocked.budget).toBeUndefined();
+    expect(serializers.write(blocked).hint).toContain("update the existing id");
+  });
+  it("uses configured token counter and caps", () => {
+    const tools = createToolSet(store, { ...config, promptMaxTokens: 100 }, undefined, (text) => text.length);
+    const result = tools.memory_write({ text: "x".repeat(500), pinned: true });
+    expect(result.budget?.tokens).toBeLessThanOrEqual(100);
+    expect(result.budget?.maxTokens).toBe(100);
+    expect(result.budget?.truncatedPinnedIds).toEqual([result.record.id]);
+  });
+  it("preserves persistence when advisory snapshot fails, without leaking errors", () => {
+    const tools = createToolSet(store, config);
+    const spy = vi.spyOn(store, "forPrompt").mockImplementation(() => { throw new Error("secret memory"); });
+    const result = tools.memory_write({ text: "persisted", pinned: true });
+    expect(result.record.id).toBeGreaterThan(0);
+    expect(result.budgetWarning).toContain("saved");
+    expect(JSON.stringify(serializers.write(result))).not.toContain("secret memory");
+    expect(tools.memory_update({ id: result.record.id, tags: ["revised"] }).budgetWarning).toBeDefined();
+    spy.mockRestore();
+    expect(store.list()[0]?.tags).toBe("revised");
+    expect(() => createToolSet(store, { ...config, promptMaxTokens: 100 })).toThrow();
+    const brokenCounter = createToolSet(store, { ...config, promptMaxTokens: 100 }, undefined, () => { throw new Error("secret counter"); });
+    expect(brokenCounter.memory_update({ id: result.record.id, text: "durable" }).budgetWarning).toBeDefined();
+    expect(store.list()[0]?.text).toBe("durable");
+  });
 });
 
 describe("tool set (surface over real engine)", () => {
@@ -203,6 +252,20 @@ describe("tool set (surface over real engine)", () => {
 });
 
 describe("memory_write output schema (F2)", () => {
+  it("validates actual optional budget and unavailable-warning serializers", async () => {
+    const { validateJsonSchemaValue, valueSchemaSpecToJsonSchema } = await import("@deepseek-ai/dsh-tools");
+    const schema = valueSchemaSpecToJsonSchema(memoryWriteOutputSchema);
+    const tools = createToolSet(store, config);
+    const written = serializers.write(tools.memory_write({ text: "pinned schema", pinned: true }));
+    expect(written.budget).toBeDefined();
+    expect(() => validateJsonSchemaValue(schema, written)).not.toThrow();
+    const spy = vi.spyOn(store, "forPrompt").mockImplementation(() => { throw new Error("private"); });
+    const warning = serializers.write(tools.memory_write({ text: "another schema", pinned: true, force: true }));
+    expect(warning.written).toBe(true);
+    expect(warning.budgetWarning).toBeDefined();
+    expect(() => validateJsonSchemaValue(schema, warning)).not.toThrow();
+    spy.mockRestore();
+  });
   it("serializers.write output validates against the registered schema in both branches", async () => {
     const { validateJsonSchemaValue, valueSchemaSpecToJsonSchema } = await import(
       "@deepseek-ai/dsh-tools",

@@ -15,6 +15,8 @@
 
 import type {
   Config,
+  BudgetFeedback,
+  TokenCounter,
   DedupeHit,
   MemoryRecord,
   MemoryStore,
@@ -22,6 +24,8 @@ import type {
   ToolSet,
 } from "./contracts.js";
 import type { ObjectValueSchemaSpec } from "@deepseek-ai/dsh-tools";
+import { promptBudgetReport } from "./prompt.js";
+import { validateTokenBudget } from "./token-counter.js";
 import { visibleScopes } from "./scope.js";
 import { normalizeTags } from "./tokenize.js";
 
@@ -68,12 +72,24 @@ export function createToolSet(
   store: MemoryStore,
   config: Config,
   scopeContext?: ToolScopeContext,
+  tokenCounter?: TokenCounter,
 ): ToolSet {
+  validateTokenBudget(config.promptMaxTokens, tokenCounter);
   const operationScope = scopeContext?.activeScope ?? config.defaultScope;
   const readableScopes =
     scopeContext === undefined
       ? undefined
       : visibleScopes(operationScope, scopeContext.includeGlobal);
+
+  function feedback(): BudgetFeedback {
+    try {
+      const scopes = readableScopes ?? visibleScopes(operationScope, config.autoProjectScope);
+      return { budget: promptBudgetReport(store.forPrompt(config.promptRecentCount, scopes), config, tokenCounter) };
+    } catch {
+      // Persistence already succeeded. Never suggest a retry or leak memory text from errors.
+      return { budgetWarning: "Memory saved; recall budget feedback unavailable." };
+    }
+  }
 
   function requireText(text: string, op = "memory_write"): string {
     const trimmed = text.trim();
@@ -109,6 +125,7 @@ export function createToolSet(
       return {
         record: record as MemoryRecord,
         dedupeHits,
+        ...(dedupeHits.length === 0 && record.pinned ? feedback() : {}),
       };
     },
 
@@ -135,7 +152,7 @@ export function createToolSet(
       if (args.tags !== undefined) patch.tags = normalizeTagsList(args.tags);
       if (args.pinned !== undefined) patch.pinned = args.pinned;
       const record = store.update(args.id, patch, readableScopes);
-      return { record };
+      return { record, ...(record !== undefined && (record.pinned || args.pinned === false) && Object.keys(patch).length > 0 ? feedback() : {}) };
     },
 
     memory_confirm(args) {
@@ -215,10 +232,36 @@ export const memorySearchResultOutputSchema = {
  * {@link serializers.write} produces). Declared here so tests can validate
  * actual outputs against the exact schema the Cordis layer registers.
  */
+export const budgetFeedbackOutputProperties = {
+  budget: {
+    type: "object", additionalProperties: false,
+    properties: {
+      selectedIds: { type: "array", items: { type: "integer" }, required: true },
+      truncatedIds: { type: "array", items: { type: "integer" }, required: true },
+      omittedIds: { type: "array", items: { type: "integer" }, required: true },
+      chars: { type: "integer", required: true }, maxChars: { type: "integer", required: true },
+      tokens: { type: "integer" }, maxTokens: { type: "integer" },
+      pinnedCount: { type: "integer", required: true }, selectedPinnedCount: { type: "integer", required: true },
+      omittedPinnedIds: { type: "array", items: { type: "integer" }, required: true },
+      truncatedPinnedIds: { type: "array", items: { type: "integer" }, required: true },
+    },
+  },
+  budgetWarning: { type: "string" },
+} satisfies ObjectValueSchemaSpec["properties"];
+
+/** Human-visible advisory; omitted/truncated pinned records need deliberate review. */
+export function renderBudgetFeedback(value: BudgetFeedback): string {
+  if (value.budgetWarning) return ` ${value.budgetWarning}`;
+  const b = value.budget;
+  if (!b) return "";
+  return ` Recall budget: ${b.chars}/${b.maxChars} chars${b.tokens === undefined ? "" : `, ${b.tokens}/${b.maxTokens} tokens`}; pinned ${b.selectedPinnedCount}/${b.pinnedCount} selected, ${b.truncatedPinnedIds.length} truncated, ${b.omittedPinnedIds.length} omitted.`;
+}
+
 export const memoryWriteOutputSchema = {
   type: "object",
   additionalProperties: false,
   properties: {
+    ...budgetFeedbackOutputProperties,
     written: { type: "boolean", required: true },
     record: memoryRecordOutputSchema,
     dedupeHits: {
@@ -264,7 +307,7 @@ export interface HitProjection {
 }
 
 /** Shape of `memory_write`'s execute() return; mirrors memoryWriteOutputSchema. */
-export interface WriteToolOutput {
+export interface WriteToolOutput extends BudgetFeedback {
   written: boolean;
   record?: RecordProjection;
   dedupeHits: HitProjection[];
@@ -273,7 +316,7 @@ export interface WriteToolOutput {
 
 /** Serializers shared by the Cordis layer and the CLI's JSON output. */
 export const serializers = {
-  write(value: { record?: MemoryRecord; dedupeHits: DedupeHit[] }): WriteToolOutput {
+  write(value: { record?: MemoryRecord; dedupeHits: DedupeHit[] } & BudgetFeedback): WriteToolOutput {
     const hits = value.dedupeHits.map(publicHit);
     if (value.dedupeHits.length > 0) {
       // Blocked by dedupe: `record` echoes the closest existing entry (see
@@ -281,11 +324,13 @@ export const serializers = {
       return {
         written: false,
         dedupeHits: hits,
-        hint: "similar memories exist; call memory_merge or re-send with force: true",
+        hint: "Similar memories exist; similarity is not a contradiction verdict. Review the hits: update the existing id for changed state, merge only equivalent facts. Do not force-write changed state alongside the old fact.",
       };
     }
     const output: WriteToolOutput = { written: true, dedupeHits: hits };
     if (value.record !== undefined) output.record = publicRecord(value.record);
+    if (value.budget !== undefined) output.budget = value.budget;
+    if (value.budgetWarning !== undefined) output.budgetWarning = value.budgetWarning;
     return output;
   },
   search(value: { results: SearchResult[] }) {
