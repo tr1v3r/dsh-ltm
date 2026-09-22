@@ -27,7 +27,8 @@ The plugin ships a bundle patch (`cordis.patch.yml`) so a profile installs it as
 | key | default | meaning |
 |---|---|---|
 | `path` | *(required)* | SQLite file, or `:memory:` |
-| `defaultScope` | `""` | scope applied when a tool call omits scope |
+| `defaultScope` | `""` | fallback scope, or fixed scope when automatic detection is disabled |
+| `autoProjectScope` | `true` | derive the active project from each agent session's cwd/Git repository |
 | `escapeSequences` | `[]` | optional output sequences broken with a zero-width space before prompt rendering |
 | `promptRecentCount` | `10` | unpinned recent memories in the recall section |
 | `promptMaxChars` | `2000` | hard UTF-16 character budget of the section; pinned survive first |
@@ -44,6 +45,18 @@ Memory text is preserved exactly in recalled prompts by default. `escapeSequence
 
 Invalid values (empty path, non-integer bounds, thresholds outside `[0,1]`, escape sequences shorter than 2 chars or containing a zero-width space) throw at plugin load — fail loud, not at first tool call.
 
+### Automatic project isolation
+
+With `autoProjectScope: true`, every agent resolves its own `session.header.cwd`; the shared DSH process cwd is never used. A Git checkout is identified by its canonical common Git directory, so subdirectories and linked worktrees share one project scope. A non-Git workspace is identified by its canonical directory. Git scope names contain only a short SHA-256 digest so every linked-worktree layout stays identical; directory scopes also include a readable basename. Absolute paths are never stored.
+
+Model-facing defaults are intentionally narrow:
+
+- writes and near-duplicate checks use the active project scope;
+- search and automatic prompt recall see only the active project plus global memories (`scope=""`);
+- update, forget, confirm, and merge reject records outside those visible scopes, and merge never crosses scope boundaries;
+- `memory_list` and the CLI remain explicit cross-project aggregation/administration surfaces.
+
+Set `autoProjectScope: false` to use only `defaultScope` as a fixed deployment scope (use `""` for global-only operation). Scope is a context-isolation boundary, not an operating-system permission boundary; anyone with direct access to the SQLite file or CLI can still administer every record.
 ### Optional offline prompt token budget
 
 ```yaml
@@ -99,6 +112,8 @@ New:
 ## Scale and limitations
 
 Near-duplicate detection scans all memories in the same scope on each non-forced `memory_write`. This design targets personal long-term fact stores rather than large document collections. Write cost grows with the number and length of memories in that scope; no benchmark-backed capacity limit is currently documented.
+
+Multiple sessions on one personal PC or server can share a local WAL database. Opening an initialized, compatible store with current FTS tokens does not take the schema writer lock; first initialization, schema repair, and token-index rebuilds still require writes. SQLite still serializes writers with a 5-second busy timeout. A `SQLITE_BUSY` error asks you to retry later; there is no automatic application retry. Dedupe remains inside the write transaction, so its full-scope scan can hold the writer lock longer as the store grows. This is not a high-concurrency service or cross-machine database synchronization.
 
 ## CLI
 

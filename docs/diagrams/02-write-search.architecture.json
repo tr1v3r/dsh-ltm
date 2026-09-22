@@ -1,0 +1,23 @@
+{
+ "schema_version":1,"diagram_type":"architecture",
+ "meta":{"title":"02 · 先存事实，再按关键词找回来","locale":"zh-CN","quality_profile":"showcase","viewBox":[1120,530]},
+ "components":[
+ {"id":"writefact","type":"backend","label":"写入一条事实","sublabel":"memory_write","pos":[40,75],"size":[240,80]},
+ {"id":"deduplicate","type":"backend","label":"同 scope 查重","sublabel":"先开启 BEGIN IMMEDIATE","pos":[440,75],"size":[240,80]},
+ {"id":"atomicstore","type":"database","label":"原文＋检索索引","sublabel":"同一事务提交到 SQLite","pos":[840,75],"size":[240,80]},
+ {"id":"keywordquery","type":"backend","label":"查询词拆成 token","sublabel":"逐个加引号，用 OR 连接","pos":[40,350],"size":[240,80]},
+ {"id":"candidates","type":"database","label":"FTS5 找候选","sublabel":"MATCH → rank → LIMIT","pos":[440,350],"size":[240,80]},
+ {"id":"ranking","type":"backend","label":"候选重新排序","sublabel":"词匹配＋字符片段相似度","pos":[840,350],"size":[240,80]}
+ ],
+ "connections":[
+ {"from":"writefact","to":"deduplicate","label":"准备写入"},
+ {"from":"deduplicate","to":"atomicstore","label":"无重复才写"},
+ {"from":"keywordquery","to":"candidates","label":"查询索引"},
+ {"from":"candidates","to":"ranking","label":"截取后重排"}
+ ],
+ "cards":[
+ {"dot":"cyan","title":"怎样让中文可查？","items":["中文：全部单字＋相邻双字；英文：ASCII 完整词。","FTS 存派生 token；事实正文保留原文（去首尾空白）。"]},
+ {"dot":"emerald","title":"写入：避免重复便签","items":["锁定后读取同 scope 全量：Jaccard ≥ 0.8 或 cosine ≥ 0.92。","命中不新增，返回相似项；force 可跳过查重。"]},
+ {"dot":"violet","title":"检索：不是语义理解","items":["rank 默认 BM25；LIMIT 之后才在候选中重排。","分数＝0.6 归一化 BM25＋0.4 字符 2～3gram 余弦。"]}
+ ]
+}

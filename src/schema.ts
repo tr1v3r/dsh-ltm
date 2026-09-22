@@ -126,8 +126,24 @@ export function assertSchemaCompatible(db: DatabaseSync): void {
  */
 export function ensureSchema(db: DatabaseSync): void {
   assertSchemaCompatible(db);
+  // A compatible version alone is not enough: older partial databases still
+  // need the idempotent DDL to create missing tables/indexes. Healthy opens
+  // should not compete with writers just to execute that same DDL again.
+  const objects = db.prepare("SELECT type, name FROM sqlite_schema").all() as {
+    type: string;
+    name: string;
+  }[];
+  const present = new Set(objects.map(({ type, name }) => `${type}:${name}`));
+  if ([
+    "table:meta", "table:memories", "table:memories_fts",
+    "index:memories_recent", "index:memories_scope",
+  ].every((object) => present.has(object))) return;
+
   db.exec("BEGIN IMMEDIATE");
   try {
+    // Another initializer may have committed while we waited for the lock.
+    // Never apply DDL based only on the earlier, unlocked compatibility check.
+    assertSchemaCompatible(db);
     db.exec(DDL);
     db.prepare(
       "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)",

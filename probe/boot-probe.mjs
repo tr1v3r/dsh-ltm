@@ -12,7 +12,8 @@
 //
 // Usage: node probe/boot-probe.mjs [db-path]   (default probe/tmp/ltm.db)
 
-import { mkdirSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -47,12 +48,25 @@ function check(label, ok, detail = "") {
   if (!ok) failures.push(label);
 }
 
+// Minimal agent-shaped scope: the registry only uses object identity for scoped
+// routing, while dsh-ltm reads the durable session cwd from this public shape.
+const probeAgent = {
+  id: "ltm-boot-probe-agent",
+  session: { header: { cwd: root } },
+};
+const isolatedDir = mkdtempSync(path.join(tmpdir(), "ltm-probe-other-"));
+const otherAgent = {
+  id: "ltm-boot-probe-other-agent",
+  session: { header: { cwd: isolatedDir } },
+};
+
 let nextCallId = 1;
-async function executeCall(name, args) {
+async function executeCall(name, args, agent = probeAgent) {
   const result = await ctx.tools.execute({
     callId: `boot-probe-${nextCallId++}`,
     name,
     arguments: args,
+    agent,
     signal: new AbortController().signal,
   });
   if (result.isError) {
@@ -61,8 +75,8 @@ async function executeCall(name, args) {
   return result;
 }
 
-async function call(name, args) {
-  return (await executeCall(name, args)).value;
+async function call(name, args, agent = probeAgent) {
+  return (await executeCall(name, args, agent)).value;
 }
 
 // 1. seven tools registered + visible
@@ -78,6 +92,9 @@ for (const name of expected) check(`tool registered+visible: ${name}`,
 const w1 = await call("memory_write", { text: "Probe fact: the release branch is dev, squash-merge convention applies.", tags: ["probe"] });
 const w1id = w1.record?.id ?? w1.id;
 check("write returns written=true", w1.written === true && w1id !== undefined, `id=${w1id}`);
+check("write uses an automatic Git project scope",
+  typeof w1.record?.scope === "string" && w1.record.scope.startsWith("git:") && !w1.record.scope.includes(root),
+  `scope=${w1.record?.scope}`);
 const dup = await call("memory_write", { text: "Probe fact: the release branch is dev, squash merge convention applies." });
 check("near-duplicate blocked", dup.written === false && dup.dedupeHits?.length > 0,
   `${dup.dedupeHits?.length} hit(s) sim=${dup.dedupeHits?.[0]?.similarity}`);
@@ -109,11 +126,34 @@ const gone = await call("memory_search", { query: "release branch squash" });
 check("forgotten record no longer searchable", !gone.results.some((r) => r.id === w1id));
 
 // 3. recall section in the assembled system prompt
-const assembly = await ctx.systemPrompt.assemble();
+const assembly = await ctx.systemPrompt.assemble({ scope: probeAgent });
 const ltmSection = assembly.sections.find((s) => s.name === "ltm:recall");
 check("system prompt has ltm:recall section", ltmSection !== undefined);
 check("recall section contains the CJK memory", !!ltmSection && ltmSection.text.includes("迁移"));
 
+// 4. two agents sharing one plugin/store stay isolated by their own session cwd
+const otherWrite = await call("memory_write", {
+  text: "Second workspace private sentinel qzjxv.",
+  tags: ["probe-isolation"],
+}, otherAgent);
+const otherId = otherWrite.record?.id;
+check("second agent writes to a different scope",
+  otherWrite.written === true && otherWrite.record?.scope !== w2.record?.scope,
+  `scope=${otherWrite.record?.scope}`);
+const primaryIsolationSearch = await call("memory_search", { query: "qzjxv" });
+check("primary agent search excludes second project",
+  !primaryIsolationSearch.results.some((record) => record.id === otherId));
+const deniedForeignDelete = await call("memory_forget", { id: otherId });
+check("primary agent cannot mutate second project", deniedForeignDelete.deleted === false);
+const otherIsolationSearch = await call("memory_search", { query: "qzjxv" }, otherAgent);
+check("second agent search sees its own project",
+  otherIsolationSearch.results.some((record) => record.id === otherId));
+const otherAssembly = await ctx.systemPrompt.assemble({ scope: otherAgent });
+const otherLtmSection = otherAssembly.sections.find((s) => s.name === "ltm:recall");
+check("primary prompt excludes second project", !ltmSection?.text.includes("qzjxv"));
+check("second prompt recalls its own project", !!otherLtmSection?.text.includes("qzjxv"));
+
 await ctx.fiber.dispose();
+rmSync(isolatedDir, { recursive: true, force: true });
 console.log(failures.length === 0 ? "\nALL PROBE CHECKS PASSED" : `\n${failures.length} FAILURE(S): ${failures.join(", ")}`);
 process.exit(failures.length === 0 ? 0 : 1);

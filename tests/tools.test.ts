@@ -147,6 +147,59 @@ describe("tool set (surface over real engine)", () => {
     expect(merged.record?.tags.split(" ").sort()).toEqual(["a", "b"]);
     expect(store.list()).toHaveLength(1);
   });
+
+  it("atomically isolates agent tools to global plus the active project", () => {
+    store.close();
+    let now = 1_000;
+    store = new MemoryStore(join(dir, "scoped.db"), {
+      staleAfterDays: config.staleAfterDays,
+      dedupeThreshold: config.dedupeThreshold,
+      dedupeCosineThreshold: config.dedupeCosineThreshold,
+      maxTextChars: config.maxTextChars,
+      searchLimitMax: config.searchLimitMax,
+      now: () => now,
+    });
+    const global = store.write("shared build convention", [], { scope: "" }).record;
+    const other = store.write("other project build convention", [], {
+      scope: "project-b",
+    }).record;
+    const tools = createToolSet(store, config, {
+      activeScope: "project-a",
+      includeGlobal: true,
+    });
+    const local = tools.memory_write({ text: "local build convention", force: true }).record;
+
+    expect(local.scope).toBe("project-a");
+    expect(tools.memory_search({ query: "build convention" }).results.map((r) => r.id).sort())
+      .toEqual([global.id, local.id].sort());
+    expect(tools.memory_update({ id: other.id, text: "leak" }).record).toBeUndefined();
+    expect(tools.memory_forget({ id: other.id }).deleted).toBe(false);
+    now = 2_000;
+    expect(tools.memory_confirm({ id: "*" }).confirmed).toBe(2);
+    expect(() =>
+      tools.memory_merge({ targetId: global.id, sourceIds: [local.id] }),
+    ).toThrow(/different scopes/);
+    const records = store.list();
+    expect(records.find((record) => record.id === other.id)).toMatchObject({
+      text: "other project build convention",
+      lastConfirmedAt: 1_000,
+    });
+    expect(records.find((record) => record.id === global.id)?.lastConfirmedAt).toBe(2_000);
+    expect(records.find((record) => record.id === local.id)?.lastConfirmedAt).toBe(2_000);
+  });
+
+  it("keeps fixed-scope mode separate from global memories", () => {
+    const global = store.write("global setting", [], { scope: "" }).record;
+    const fixed = store.write("fixed setting", [], { scope: "fixed" }).record;
+    const tools = createToolSet(store, { ...config, defaultScope: "fixed" }, {
+      activeScope: "fixed",
+      includeGlobal: false,
+    });
+
+    expect(tools.memory_search({ query: "setting" }).results.map((r) => r.id))
+      .toEqual([fixed.id]);
+    expect(tools.memory_forget({ id: global.id }).deleted).toBe(false);
+  });
 });
 
 describe("memory_write output schema (F2)", () => {

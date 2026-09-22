@@ -126,8 +126,12 @@ export interface MemoryStore {
   /** Store one memory; runs dedupe first unless `force`. */
   write(text: string, tags: readonly string[], options?: WriteOptions):
     { record: MemoryRecord; dedupeHits: DedupeHit[] };
-  /** Hybrid search over text and tags, best match first (R2, R3). */
-  search(query: string, limit?: number, scope?: ScopeName): SearchResult[];
+  /** Hybrid search over text and tags, optionally limited to one or more scopes. */
+  search(
+    query: string,
+    limit?: number,
+    scope?: ScopeName | readonly ScopeName[],
+  ): SearchResult[];
   /** Filtered browse (R6, memory_list). Limits are validated and hard-capped. */
   list(filter?: ListFilter): MemoryRecord[];
   /**
@@ -136,17 +140,23 @@ export interface MemoryStore {
    * aborts the complete import as a conflict.
    */
   importRecords(records: readonly MemoryRecord[]): { imported: number; skipped: number };
-  /** Records for the recall section: pinned first, then recent, deduped. */
-  forPrompt(recentCount: number): MemoryRecord[];
-  /** Revise text/tags/pinned in place, keeping the id (memory_update). */
-  update(id: number, patch: { text?: string; tags?: readonly string[]; pinned?: boolean }):
-    MemoryRecord | undefined;
-  /** Refresh lastConfirmedAt / clear stale for one or all records (R5). */
-  confirm(id: number | "*"): number;
-  /** Merge duplicates; returns the surviving record (memory_merge). */
-  merge(input: MergeInput): MemoryRecord | undefined;
-  /** Delete one memory. */
-  forget(id: number): boolean;
+  /** Records for recall: pinned first, then recent, optionally scope-filtered. */
+  forPrompt(
+    recentCount: number,
+    scopes?: readonly ScopeName[],
+  ): MemoryRecord[];
+  /** Revise text/tags/pinned, optionally constrained to allowed scopes. */
+  update(
+    id: number,
+    patch: { text?: string; tags?: readonly string[]; pinned?: boolean },
+    scopes?: readonly ScopeName[],
+  ): MemoryRecord | undefined;
+  /** Refresh lastConfirmedAt for one/all records, optionally scope-filtered. */
+  confirm(id: number | "*", scopes?: readonly ScopeName[]): number;
+  /** Merge duplicates, optionally constrained to allowed scopes. */
+  merge(input: MergeInput, scopes?: readonly ScopeName[]): MemoryRecord | undefined;
+  /** Delete one memory, optionally constrained to allowed scopes. */
+  forget(id: number, scopes?: readonly ScopeName[]): boolean;
   /** Total stored memories. */
   count(): number;
   /** Close the connection; idempotent. */
@@ -196,8 +206,10 @@ export type TokenCounter = (text: string) => number;
 export interface Config {
   /** SQLite file for this deployment's memories, or `:memory:`. Required. */
   path: string;
-  /** Default scope applied when a tool call omits scope ("" = global). */
+  /** Fallback/fixed scope when automatic project detection is unavailable or disabled. */
   defaultScope: ScopeName;
+  /** Derive the active scope from each agent session's cwd/Git repository. */
+  autoProjectScope: boolean;
   /** Opt-in output sequences broken with a zero-width space before prompt rendering. Default `[]`. */
   escapeSequences: readonly string[];
   /** Unpinned recent memories rendered in the recall section. */

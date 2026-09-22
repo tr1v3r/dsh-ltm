@@ -65,6 +65,7 @@ export function escapeForPrompt(
 const ConfigSchema = z.object({
   path: z.string().required(),
   defaultScope: z.string().default(""),
+  autoProjectScope: z.boolean().default(true),
   escapeSequences: z.array(z.string()).default([]),
   promptRecentCount: z.number().default(10),
   promptMaxChars: z.number().default(2000),

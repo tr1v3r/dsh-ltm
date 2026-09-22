@@ -1,7 +1,7 @@
 # dsh-ltm 0.1 需求规格（P0 定稿）
 
 > 状态：冻结。变更需同步 `src/contracts.ts` 与 `docs/data-model.md`。
-> 上游计划见 `PLAN.md`；本文是 R1–R10 → 验收的唯一映射。
+> 本文是 R1–R11 → 验收的唯一映射。
 
 ## 1. 范围
 
@@ -23,6 +23,7 @@
 | R8 自动迁移 | 旧 `~/.config/dsh/memory/memory.db` → 新 schema | 对真实旧库拷贝跑 `migrate`：`MigrationReport.migratedCount == sourceCount`，原库文件字节不变（迁移后 sha256 对比），pinned 记忆迁移后可检索 |
 | R9 提示词渲染 | pinned 优先 + 字符预算 + 默认保持原文 | `escapeSequences` 默认 `[]`，模板式文本原样渲染；显式配置定界符时才以零宽空格打断，且嵌套序列与文本自带零宽空格的边界有单测；config 非法值（如 threshold∉[0,1]）load 即抛 |
 | R10 发布 | GitHub + npm | CI tag 门控发布（参照 dsh-quote-followup）；**push/publish 前需用户本人确认**；`main` 分支保护：只能经 PR 合并，必检 `test (22)`/`test (24)`/`pack` 全绿且分支最新，禁强推与删分支，管理员不豁免（见 `docs/integration.md` §1） |
+| R11 项目记忆隔离 | 随 agent cwd / Git 仓库自动切换 scope | Git 子目录与 linked worktree 得到相同 scope，非 Git cwd 独立；模型工具默认只读当前项目 + 全局、写当前项目、禁止跨 scope 修改/合并；`memory_list`/CLI 保留显式聚合（单测 + 真实 boot） |
 
 ## 3. 工具集契约（§4 定稿）
 

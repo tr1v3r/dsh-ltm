@@ -64,6 +64,7 @@ describe("loadConfig", () => {
     expect(config.dedupeThreshold).toBe(0.8);
     expect(config.staleAfterDays).toBe(90);
     expect(config.promptRecentCount).toBe(10);
+    expect(config.autoProjectScope).toBe(true);
   });
 
   it("throws on missing/empty path", () => {

@@ -1,0 +1,24 @@
+{
+ "schema_version":1,"diagram_type":"architecture",
+ "meta":{"title":"01 · 换个会话，不必从头交代","locale":"zh-CN","quality_profile":"showcase","viewBox":[1120,530]},
+ "components":[
+ {"id":"conversation","type":"external","label":"这次对话","sublabel":"告诉助手你的长期偏好","pos":[40,80],"size":[240,80]},
+ {"id":"decision","type":"backend","label":"模型决定记什么","sublabel":"主动调用 memory_write","pos":[440,80],"size":[240,80]},
+ {"id":"notebook","type":"database","label":"本地记忆本","sublabel":"SQLite 保存独立事实","pos":[840,80],"size":[240,80]},
+ {"id":"context","type":"backend","label":"新会话的提示词","sublabel":"自动加入置顶＋近期","pos":[840,350],"size":[240,80]},
+ {"id":"recall","type":"backend","label":"不在提示词里？","sublabel":"模型主动 memory_search","pos":[440,350],"size":[240,80]},
+ {"id":"answer","type":"external","label":"接着合作","sublabel":"结合找到的事实回答","pos":[40,350],"size":[240,80]}
+ ],
+ "connections":[
+ {"from":"conversation","to":"decision","label":"识别长期事实"},
+ {"from":"decision","to":"notebook","label":"显式写入"},
+ {"from":"notebook","to":"context","label":"自动选取","labelDy":110},
+ {"from":"context","to":"recall","label":"需要更多时"},
+ {"from":"recall","to":"answer","label":"查询后使用"}
+ ],
+ "cards":[
+ {"dot":"cyan","title":"像便签，不是聊天录像","items":["适合：语言偏好、项目约定、长期决定。","模型挑选并写入；不会自动扫描聊天做摘要。"]},
+ {"dot":"emerald","title":"自动带入有上限","items":["默认预算 2000 字符，近期最多 10 条。","置顶优先，但预算有限，并非保证全部带入。"]},
+ {"dot":"amber","title":"边界要知道","items":["提示词从全库选取，没有 scope 过滤。","存储与检索本地运行；提示词会发给所选 LLM。"]}
+ ]
+}

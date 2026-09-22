@@ -1,0 +1,23 @@
+{
+ "schema_version":1,"diagram_type":"lifecycle",
+ "meta":{"title":"03 · 记忆要复核，不会自己消失","locale":"zh-CN","quality_profile":"showcase","viewBox":[1030,640]},
+ "lanes":[{"id":"main","label":"一条事实的维护过程"},{"id":"review","label":"复核后继续使用"},{"id":"terminal","label":"明确删除才会退出"}],
+ "states":[
+ {"id":"savedfact","type":"start","label":"写入成功","sublabel":"开始记录确认时间","lane":"main","col":0},
+ {"id":"freshfact","type":"active","label":"尚未过期","sublabel":"按确认时间判断","lane":"main","col":1},
+ {"id":"stalefact","type":"waiting","label":"待复核 stale","sublabel":"默认超过 90 天未确认","lane":"main","col":2},
+ {"id":"checkfact","type":"decision","label":"核对事实","sublabel":"仍对？修改？删除？","lane":"main","col":3},
+ {"id":"confirmedfact","type":"active","label":"确认仍有效","sublabel":"memory_confirm","lane":"review","col":2},
+ {"id":"removedfact","type":"neutral","label":"明确删除","sublabel":"memory_forget","lane":"terminal","col":1}
+ ],
+ "transitions":[
+ {"from":"checkfact","to":"removedfact","label":"不再需要","variant":"dashed","labelAt":[556,202]},
+ {"from":"checkfact","to":"confirmedfact","label":"核对后确认","labelDx":65},
+ {"from":"confirmedfact","to":"freshfact","label":"刷新确认时间","variant":"emphasis","route":"top-channel"}
+ ],
+ "cards":[
+ {"dot":"cyan","title":"维护：改内容 ≠ 重新确认","items":["stale 只是按 lastConfirmedAt 计算的提醒，不自动删除。","update 保留 id 并修改内容；不会自动 confirm。","confirm 刷新确认时间；merge 合并并删除来源记录。"]},
+ {"dot":"emerald","title":"适合：个人事实与项目约定","items":["本地检索无需 embedding 网络；部署轻，事实可维护。","defaultScope 要显式配置，不自动识别 Git 或目录。","空 scope：写入全局桶；工具 search 搜索全库。"]},
+ {"dot":"amber","title":"不适合：万能知识库","items":["embedding 仅预留接口，不保证同义词语义召回。","同 scope 全量查重，更适合少量事实而非海量文档。","不要存密码或临时任务；提示词会给所选 LLM。"]}
+ ]
+}

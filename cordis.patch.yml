@@ -16,6 +16,7 @@
       config:
         path: !!js dshHomePath('memory/ltm.db')
         defaultScope: ''
+        autoProjectScope: true
         promptRecentCount: 10
         promptMaxChars: 2000
         maxTextChars: 2000
