@@ -57,6 +57,10 @@ New:
 - `memory_list(scope?, tags?, stale?, limit?)` — filtered browse (tags AND)
 - `memory_merge(targetId, sourceIds[], text?, tags?)` — merge duplicates; tags default to the union
 
+## Scale and limitations
+
+Near-duplicate detection scans all memories in the same scope on each non-forced `memory_write`. This design targets personal long-term fact stores rather than large document collections. Write cost grows with the number and length of memories in that scope; no benchmark-backed capacity limit is currently documented.
+
 ## CLI
 
 ```sh
