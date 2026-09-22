@@ -193,7 +193,7 @@ export interface Config {
   path: string;
   /** Default scope applied when a tool call omits scope ("" = global). */
   defaultScope: ScopeName;
-  /** Sequences escaped with a zero-width space before prompt rendering (R9). Default `["{{"]`. */
+  /** Opt-in output sequences broken with a zero-width space before prompt rendering. Default `[]`. */
   escapeSequences: readonly string[];
   /** Unpinned recent memories rendered in the recall section. */
   promptRecentCount: number;

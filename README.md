@@ -5,7 +5,7 @@ Structured long-term memory for [DeepSeek Harness](https://github.com/deepseek-a
 ## Why
 
 - `dsh-memory@0.1.0` is flat-text + FTS5 with the default tokenizer: Chinese retrieval effectively does not work (whole sentences become single tokens).
-- Keeping memory → chezmoi template injection safe required two locally maintained pnpm patches (`{{` zero-width-space escaping). Here the escaping is built in and configurable.
+- Long-lived memories need lifecycle controls beyond append/search: structured scopes and tags, duplicate detection, review timestamps, and bounded recall.
 
 ## Install into a profile
 
@@ -28,7 +28,7 @@ The plugin ships a bundle patch (`cordis.patch.yml`) so a profile installs it as
 |---|---|---|
 | `path` | *(required)* | SQLite file, or `:memory:` |
 | `defaultScope` | `""` | scope applied when a tool call omits scope |
-| `escapeSequences` | `['{{']` | sequences broken with a zero-width space before prompt rendering |
+| `escapeSequences` | `[]` | optional output sequences broken with a zero-width space before prompt rendering |
 | `promptRecentCount` | `10` | unpinned recent memories in the recall section |
 | `promptMaxChars` | `2000` | character budget of the section; pinned survive first |
 | `maxTextChars` | `2000` | max characters per memory |
@@ -37,6 +37,8 @@ The plugin ships a bundle patch (`cordis.patch.yml`) so a profile installs it as
 | `dedupeThreshold` | `0.8` | Jaccard similarity ≥ this marks a near-duplicate on write |
 | `dedupeCosineThreshold` | `0.92` | cosine similarity ≥ this also marks a near-duplicate |
 | `staleAfterDays` | `90` | memories unconfirmed for this long render as stale |
+
+Memory text is preserved exactly in recalled prompts by default. `escapeSequences` is an explicit deployment-level opt-in for environments that pass rendered prompts through an additional delimiter-based parser; DSH itself does not require it.
 
 Invalid values (empty path, non-integer bounds, thresholds outside `[0,1]`, escape sequences shorter than 2 chars or containing a zero-width space) throw at plugin load — fail loud, not at first tool call.
 

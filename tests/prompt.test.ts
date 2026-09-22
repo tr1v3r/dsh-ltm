@@ -32,7 +32,7 @@ describe("isStale", () => {
 });
 
 describe("renderPrompt", () => {
-  const config = { promptMaxChars: 2000, escapeSequences: ["{{"], staleAfterDays: 90 };
+  const config = { promptMaxChars: 2000, escapeSequences: [], staleAfterDays: 90 };
 
   it("renders pinned first with flags, tags, scope", () => {
     const text = renderPrompt(
@@ -47,8 +47,17 @@ describe("renderPrompt", () => {
     expect(text.indexOf("#5")).toBeLessThan(text.indexOf("#6"));
   });
 
-  it("escapes {{ with a zero-width space", () => {
-    const text = renderPrompt([record({ text: "chezmoi {{ .var }}" })], config);
+  it("preserves template-like text by default", () => {
+    const text = renderPrompt([record({ text: "example {{ .var }}" })], config);
+    expect(text).toContain("example {{ .var }}");
+    expect(text).not.toContain(ZERO_WIDTH_SPACE);
+  });
+
+  it("breaks explicitly configured output sequences", () => {
+    const text = renderPrompt([record({ text: "example {{ .var }}" })], {
+      ...config,
+      escapeSequences: ["{{"],
+    });
     expect(text).not.toContain("{{");
     expect(text).toContain(`{${ZERO_WIDTH_SPACE}{ .var }}`);
   });

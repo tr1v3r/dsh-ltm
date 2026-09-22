@@ -11,30 +11,30 @@
 import z from "@deepseek-ai/schemastery";
 import type { Config as LtmConfig } from "./contracts.js";
 
-/** Zero-width space used to break template-injection sequences (R9). */
+/** Zero-width space used to break explicitly configured output sequences. */
 export const ZERO_WIDTH_SPACE = "\u200b";
 
 /**
  * Insert a zero-width space after the first character of `sequence`, breaking
  * the sequence without changing what a human reads.
  *
- * @param sequence - the raw sequence, e.g. `{{`.
- * @returns the escaped form, e.g. `{\u200b{`.
+ * @param sequence - a raw sequence explicitly configured by the operator.
+ * @returns the escaped form.
  */
 function escapeSequence(sequence: string): string {
   return sequence[0] + ZERO_WIDTH_SPACE + sequence.slice(1);
 }
 
 /**
- * Escape every configured `escapeSequences` occurrence in `text` (R9).
+ * Break every explicitly configured `escapeSequences` occurrence in `text`.
  *
- * Escaping is idempotent: an already-escaped `{\u200b{` no longer contains the
- * raw `{{` substring, and text that already carries zero-width spaces is left
- * untouched unless it still contains a raw sequence.
+ * This optional output transform is idempotent. An empty sequence list—the
+ * default—preserves stored memory text exactly. Deployments that pass rendered
+ * prompts through another parser may opt in to breaking its delimiters.
  *
  * @param text - memory text as stored.
- * @param escapeSequences - sequences to break up.
- * @returns the text safe to render into a prompt.
+ * @param escapeSequences - output sequences to break up.
+ * @returns the text to render into a prompt.
  */
 export function escapeForPrompt(
   text: string,
@@ -46,9 +46,9 @@ export function escapeForPrompt(
     const escaped = escapeSequence(sequence);
     // `replaceAll` consumes non-overlapping matches left-to-right, so a cluster
     // of an odd number of the lead character (e.g. "{{{" or "{{{ .x }}}") leaves
-    // a trailing raw pair — a live template sequence that defeats R9. Repeat
-    // until no raw occurrence remains. Each pass only inserts zero-width spaces
-    // (which can never form a new raw sequence), so the raw-match count strictly
+    // a trailing raw pair. Repeat until no configured raw occurrence remains.
+    // Each pass only inserts zero-width spaces (which can never form a new raw
+    // sequence), so the raw-match count strictly
     // decreases: the loop terminates and stays idempotent on already-escaped text.
     while (out.includes(sequence)) {
       out = out.replaceAll(sequence, escaped);
@@ -65,7 +65,7 @@ export function escapeForPrompt(
 const ConfigSchema = z.object({
   path: z.string().required(),
   defaultScope: z.string().default(""),
-  escapeSequences: z.array(z.string()).default(["{{"]),
+  escapeSequences: z.array(z.string()).default([]),
   promptRecentCount: z.number().default(10),
   promptMaxChars: z.number().default(2000),
   maxTextChars: z.number().default(2000),
