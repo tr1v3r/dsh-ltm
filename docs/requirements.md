@@ -1,7 +1,7 @@
 # dsh-ltm 0.1 需求规格（P0 定稿）
 
 > 状态：冻结。变更需同步 `src/contracts.ts` 与 `docs/data-model.md`。
-> 上游计划见 `PLAN.md`；本文是 R1–R10 → 验收的唯一映射。
+> 本文是 R1–R10 → 验收的唯一映射。
 
 ## 1. 范围
 
