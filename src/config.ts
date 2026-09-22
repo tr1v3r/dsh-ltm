@@ -68,6 +68,8 @@ const ConfigSchema = z.object({
   escapeSequences: z.array(z.string()).default(["{{"]),
   promptRecentCount: z.number().default(10),
   promptMaxChars: z.number().default(2000),
+  promptMaxTokens: z.number(),
+  promptTokenizerPath: z.string(),
   maxTextChars: z.number().default(2000),
   searchLimitDefault: z.number().default(10),
   searchLimitMax: z.number().default(50),
@@ -100,6 +102,17 @@ const THRESHOLD_FIELDS = ["dedupeThreshold", "dedupeCosineThreshold"] as const;
 export function validateConfig(config: LtmConfig): void {
   if (config.path.length === 0) {
     throw new Error("ltm: `path` must not be empty");
+  }
+  if (config.promptMaxTokens !== undefined &&
+      (!Number.isSafeInteger(config.promptMaxTokens) || config.promptMaxTokens < 1)) {
+    throw new Error("ltm: promptMaxTokens must be a safe integer >= 1");
+  }
+  if (config.promptTokenizerPath !== undefined &&
+      (typeof config.promptTokenizerPath !== "string" || config.promptTokenizerPath.trim().length === 0)) {
+    throw new Error("ltm: promptTokenizerPath must be a nonempty string");
+  }
+  if ((config.promptMaxTokens === undefined) !== (config.promptTokenizerPath === undefined)) {
+    throw new Error("ltm: promptMaxTokens and promptTokenizerPath must be configured together");
   }
   for (const field of POSITIVE_INTEGER_FIELDS) {
     const value = config[field];

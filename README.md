@@ -30,7 +30,9 @@ The plugin ships a bundle patch (`cordis.patch.yml`) so a profile installs it as
 | `defaultScope` | `""` | scope applied when a tool call omits scope |
 | `escapeSequences` | `['{{']` | sequences broken with a zero-width space before prompt rendering |
 | `promptRecentCount` | `10` | unpinned recent memories in the recall section |
-| `promptMaxChars` | `2000` | character budget of the section; pinned survive first |
+| `promptMaxChars` | `2000` | hard UTF-16 character budget of the section; pinned survive first |
+| `promptMaxTokens` | *(unset)* | optional positive safe-integer hard token cap, alongside characters |
+| `promptTokenizerPath` | *(unset)* | local supported Hugging Face `tokenizer.json`; required together with `promptMaxTokens` |
 | `maxTextChars` | `2000` | max characters per memory |
 | `searchLimitDefault` / `searchLimitMax` | `10` / `50` | search result limits |
 | `promptOrder` | `50` | recall section order |
@@ -39,6 +41,43 @@ The plugin ships a bundle patch (`cordis.patch.yml`) so a profile installs it as
 | `staleAfterDays` | `90` | memories unconfirmed for this long render as stale |
 
 Invalid values (empty path, non-integer bounds, thresholds outside `[0,1]`, escape sequences shorter than 2 chars or containing a zero-width space) throw at plugin load — fail loud, not at first tool call.
+
+### Optional offline prompt token budget
+
+```yaml
+# Add to the ltm entry's config; provision this local asset yourself.
+promptMaxChars: 2000
+promptMaxTokens: 512
+promptTokenizerPath: /path/to/pinned-model-revision/tokenizer.json
+```
+
+Neither option is enabled by default: existing character-only output stays unchanged.
+Both must be set together. The optional `@huggingface/tokenizers@0.2.0` dependency
+is loaded **only at configured plugin startup**, once; rendering remains synchronous,
+with no network requests, downloads, or file reads. Install optional dependencies
+if your package manager omits them. The CLI does not render prompts and is unchanged.
+
+This supports a **restricted, fidelity-tested ByteLevel/BPE subset**: GPT-2-style
+ByteLevel or the published DeepSeek-V3 Isolated Split patterns followed by ByteLevel,
+with no normalizer (or an empty Sequence), a complete byte vocabulary and deterministic
+BPE. Unsupported pipelines/options fail at startup, rather than silently approximating
+an arbitrary Hugging Face tokenizer. Missing files, malformed JSON, invalid limits,
+and missing optional dependencies also fail loudly before opening the store.
+
+The cap counts the **complete escaped recall section**, including header, metadata,
+newlines, truncation ellipsis and any omission notice, without adding BOS/EOS or a
+chat template. Pinned records take priority; recent records never displace pinned
+records for an omission notice. When necessary the first pinned line is shortened
+on a Unicode code-point boundary. If even its identifiable prefix plus header and
+ellipsis cannot fit both caps, the section is empty. Counts are not additive; every
+candidate is encoded as a whole. UTF-16 character limits remain hard caps.
+
+Offline counts are exact for the supported chosen tokenizer definition, **not a
+promise of server-reported usage**: providers may use another revision/tokenizer,
+chat framing or special-token policy. No automatic model routing or server usage
+calibration is performed. FTS/search/dedupe tokenization and schema versions are
+unaffected. See [provisioning, compatibility and verification](docs/prompt-token-budget.md)
+for asset version/hash/license requirements, overhead and fidelity evidence.
 
 ## Model-facing tools
 

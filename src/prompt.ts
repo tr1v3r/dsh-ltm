@@ -9,7 +9,8 @@
  * @module dsh-ltm/prompt
  */
 
-import type { Config, MemoryRecord, MemoryStore } from "./contracts.js";
+import type { Config, MemoryRecord, MemoryStore, TokenCounter } from "./contracts.js";
+import { validateTokenBudget } from "./token-counter.js";
 import { escapeForPrompt } from "./config.js";
 import { isStale } from "./expire.js";
 
@@ -102,8 +103,13 @@ interface RenderedLine {
  */
 export function renderPrompt(
   records: readonly MemoryRecord[],
-  config: Pick<Config, "promptMaxChars" | "escapeSequences" | "staleAfterDays">,
+  config: Pick<Config, "promptMaxChars" | "escapeSequences" | "staleAfterDays" | "promptMaxTokens">,
+  tokenCounter?: TokenCounter,
 ): string {
+  validateTokenBudget(config.promptMaxTokens, tokenCounter);
+  if (config.promptMaxTokens !== undefined) {
+    return renderTokenBounded(records, config, tokenCounter!, config.promptMaxTokens);
+  }
   if (records.length === 0) return "";
   const budget = config.promptMaxChars;
   const render = (record: MemoryRecord): RenderedLine => ({
@@ -203,7 +209,76 @@ export function renderPrompt(
  * @param config - validated plugin config.
  * @returns a zero-argument renderer for the recall section.
  */
-export function recallRenderer(store: MemoryStore, config: Config): () => string {
+export function recallRenderer(store: MemoryStore, config: Config, tokenCounter?: TokenCounter): () => string {
+  validateTokenBudget(config.promptMaxTokens, tokenCounter);
   return () =>
-    renderPrompt(store.forPrompt(config.promptRecentCount), config);
+    renderPrompt(store.forPrompt(config.promptRecentCount), config, tokenCounter);
+}
+
+/** Opt-in path deliberately leaves the frozen char-only algorithm untouched.
+ * Count each complete candidate: token counts are neither additive nor monotone
+ * in prefix length (BPE merges can reduce the count after adding characters).
+ */
+function renderTokenBounded(
+  records: readonly MemoryRecord[],
+  config: Pick<Config, "promptMaxChars" | "escapeSequences" | "staleAfterDays">,
+  count: TokenCounter,
+  maxTokens: number,
+): string {
+  const fits = (text: string): boolean => {
+    if (text.length > config.promptMaxChars) return false;
+    const tokens = count(text);
+    if (!Number.isSafeInteger(tokens) || tokens < 0) throw new Error("ltm: TokenCounter must return a nonnegative safe integer");
+    return tokens <= maxTokens;
+  };
+  if (records.length === 0) return "";
+  const render = (record: MemoryRecord): RenderedLine => ({
+    line: promptLine(record, config.escapeSequences, config.staleAfterDays),
+    pinned: record.pinned,
+    identity: `- (#${record.id}`,
+  });
+  const pinned = records.filter((record) => record.pinned).map(render);
+  const recent = records.filter((record) => !record.pinned).map(render);
+  const kept: RenderedLine[] = [];
+  const section = (entries: readonly RenderedLine[]) => HEADER + entries.map((entry) => entry.line).join("\n");
+  let omitted = 0;
+  for (const entry of pinned) {
+    if (fits(section([...kept, entry]))) kept.push(entry);
+    else omitted++;
+  }
+  if (omitted === 0) {
+    for (const entry of recent) {
+      if (fits(section([...kept, entry]))) kept.push(entry);
+      else omitted++;
+    }
+  } else omitted += recent.length;
+
+  if (kept.length === 0 && pinned.length > 0) {
+    const first = pinned[0]!;
+    let prefix = truncateToUnits(first.line, config.promptMaxChars - HEADER.length - TRUNCATION_MARKER.length);
+    // Descending code-point prefixes find the longest fitting prefix without
+    // assuming monotonicity. Never emit a broken surrogate or unidentifiable id.
+    while (prefix.length >= first.identity.length) {
+      const candidate = HEADER + prefix + TRUNCATION_MARKER;
+      if (fits(candidate)) {
+        const withNotice = candidate + omissionNotice(records.length - 1);
+        return fits(withNotice) ? withNotice : candidate;
+      }
+      const last = prefix.charCodeAt(prefix.length - 1);
+      prefix = prefix.slice(0, prefix.length - (last >= 0xdc00 && last <= 0xdfff ? 2 : 1));
+    }
+    // Impossible budget: hard caps win over the first-pinned fallback.
+    return "";
+  }
+  if (kept.length === 0) return "";
+  for (;;) {
+    const body = section(kept);
+    const candidate = body + omissionNotice(omitted);
+    if (fits(candidate)) return candidate;
+    const last = kept[kept.length - 1];
+    if (!last || last.pinned) return body; // already measured; never evict pinned for notice
+    kept.pop();
+    omitted++;
+    if (kept.length === 0) return "";
+  }
 }
