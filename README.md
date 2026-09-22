@@ -12,10 +12,12 @@ Structured long-term memory for [DeepSeek Harness](https://github.com/deepseek-a
 With `@tr1v3r/dsh-ltm` **0.1.2 or newer**, install and register the bundled configuration in one command:
 
 ```sh
-dsh plugin --profile web add @tr1v3r/dsh-ltm@0.1.2
+dsh plugin --profile web add @tr1v3r/dsh-ltm
 ```
 
-The version is explicit because pnpm 11's default minimum release age can otherwise select an older, bundle-less version during the first 24 hours after release. With the default non-strict policy, an explicitly requested version is recorded as a package-specific release-age exception; deployments using `minimumReleaseAgeStrict` may require approval or waiting for the version to mature.
+This command intentionally does not pin a historical release. Your package manager's release-age policy still applies: pnpm 11 defaults to a 24-hour delay, so it may select an earlier eligible version immediately after a release (even with `@latest`). To try a just-published release, check [Releases](https://github.com/tr1v3r/dsh-ltm/releases) and explicitly append its version, or wait for it to mature. With the default non-strict policy, an explicit version is recorded as a package-specific release-age exception; `minimumReleaseAgeStrict` may require approval.
+
+**Initial release caveat (2026-09-22):** one-command installation requires **0.1.2 or newer**. Until 0.1.2 has aged 24 hours, the command above can select bundle-less 0.1.0/0.1.1; use `@tr1v3r/dsh-ltm@0.1.2` during that initial window. This is a temporary workaround, not a permanent version recommendation.
 
 Replace `web` with your profile name (for example `dsh-tui`), then restart that profile. The bundle sets the database path to `$DSH_HOME/memory/ltm.db`; no API key or embedding service is needed.
 
