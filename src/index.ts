@@ -12,6 +12,8 @@ import { loadConfig } from "./config.js";
 import { MemoryStore } from "./store.js";
 import {
   createToolSet,
+  budgetFeedbackOutputProperties,
+  renderBudgetFeedback,
   memoryRecordOutputSchema,
   memorySearchResultOutputSchema,
   memoryWriteOutputSchema,
@@ -21,7 +23,8 @@ import {
 import { promptLine, renderPrompt } from "./prompt.js";
 import { loadTokenCounter } from "./token-counter.js";
 export { loadTokenCounter } from "./token-counter.js";
-export type { TokenCounter } from "./contracts.js";
+export type { TokenCounter, PromptRenderResult, PromptBudgetReport, BudgetFeedback } from "./contracts.js";
+export { renderPromptResult, promptBudgetReport } from "./prompt.js";
 import {
   cwdFromAgentScope,
   resolveProjectScope,
@@ -33,13 +36,13 @@ export const inject = ["tools", "systemPrompt"];
 export { Config } from "./config.js";
 
 const WRITE_DESCRIPTION =
-  "Remember one durable fact across sessions: a user preference, a project convention, a decision and its reason, or a hard-won detail about this codebase. Write one self-contained fact per call — it will be read back with no surrounding conversation. Do NOT store transient task state (use the todo list), secrets, or anything the repository already records. Near-duplicates are detected on write; if similar memories come back, merge them or re-send with force: true.";
+  "Remember one durable fact across sessions: a user preference, a project convention, a decision and its reason, or a hard-won detail about this codebase. Write one self-contained fact per call — it will be read back with no surrounding conversation. Do NOT store transient task state (use the todo list), secrets, or anything the repository already records. Before writing changed state, search for the existing fact if its id is not already known, then update that id. Search is guidance, not a required gate. Near-duplicate similarity is not a contradiction verdict: merge equivalent facts, update superseded facts, and do not force-write changed state alongside the old fact.";
 const SEARCH_DESCRIPTION =
   "Search global and current-project memories by keyword (CJK-aware tokenization, hybrid rerank). Pinned and recent memories already appear in your context, so search when you need something older or more specific than what you can already see.";
 const FORGET_DESCRIPTION =
   "Delete one visible global/current-project memory by id, for a fact that is now wrong or obsolete. Ids come from memory_search or memory_write.";
 const UPDATE_DESCRIPTION =
-  "Revise a visible global/current-project memory's text/tags/pinned in place, keeping its id. Prefer this over delete-and-rewrite so id references in the conversation stay valid.";
+  "Revise a visible global/current-project memory's text/tags/pinned in place, keeping its id. Prefer this for changed state over writing another record or delete-and-rewrite. If the id is unknown, search first; a known id can be updated directly without a mandatory search.";
 const CONFIRM_DESCRIPTION =
   'Confirm one visible memory is still accurate (refreshes its review timestamp, clears the stale flag). Pass id: "*" to confirm all global/current-project memories.';
 const LIST_DESCRIPTION =
@@ -104,7 +107,7 @@ export function apply(ctx: Context, rawConfig: unknown) {
     return createToolSet(storeProxy, config, {
       activeScope: activeScope(exec?.agent),
       includeGlobal: config.autoProjectScope,
-    });
+    }, tokenCounter);
   }
 
   ctx.systemPrompt.section({
@@ -158,8 +161,8 @@ export function apply(ctx: Context, rawConfig: unknown) {
             type: "text",
             text:
               value.written && value.record
-                ? `Stored memory #${value.record.id}${value.record.pinned ? " (pinned)" : ""}.`
-                : `Not stored — ${value.dedupeHits.length} near-duplicate(s) found; merge them or re-send with force: true.`,
+                ? `Stored memory #${value.record.id}${value.record.pinned ? " (pinned)" : ""}.${renderBudgetFeedback(value)}`
+                : `Not stored — ${value.dedupeHits.length} near-duplicate(s) found. ${value.hint ?? "Review existing facts before retrying."}`,
           },
         ],
       },
@@ -170,8 +173,7 @@ export function apply(ctx: Context, rawConfig: unknown) {
         rawInput: args,
       }),
       async execute(args, exec) {
-        const { record, dedupeHits } = toolsFor(exec).memory_write(args);
-        return serializers.write({ record, dedupeHits });
+        return serializers.write(toolsFor(exec).memory_write(args));
       },
     }),
   );
@@ -286,6 +288,7 @@ export function apply(ctx: Context, rawConfig: unknown) {
           type: "object",
           additionalProperties: false,
           properties: {
+            ...budgetFeedbackOutputProperties,
             updated: { type: "boolean", required: true },
             id: { type: "integer", required: true },
           },
@@ -294,14 +297,14 @@ export function apply(ctx: Context, rawConfig: unknown) {
           {
             type: "text",
             text: value.updated
-              ? `Updated memory #${value.id}.`
+              ? `Updated memory #${value.id}.${renderBudgetFeedback(value)}`
               : `No memory #${value.id} to update.`,
           },
         ],
       },
       async execute(args, exec) {
-        const { record } = toolsFor(exec).memory_update(args);
-        return { updated: record !== undefined, id: args.id };
+        const { record, ...feedback } = toolsFor(exec).memory_update(args);
+        return { updated: record !== undefined, id: args.id, ...feedback };
       },
     }),
   );

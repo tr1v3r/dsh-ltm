@@ -79,7 +79,8 @@ Neither option is enabled by default: existing character-only output stays uncha
 Both must be set together. The optional `@huggingface/tokenizers@0.2.0` dependency
 is loaded **only at configured plugin startup**, once; rendering remains synchronous,
 with no network requests, downloads, or file reads. Install optional dependencies
-if your package manager omits them. The CLI does not render prompts and is unchanged.
+if your package manager omits them. CLI `doctor` can render a diagnostic projection
+with an explicitly supplied JSON configuration (it never reads the running profile).
 
 This supports a **restricted, fidelity-tested ByteLevel/BPE subset**: GPT-2-style
 ByteLevel or the published DeepSeek-V3 Isolated Split patterns followed by ByteLevel,
@@ -118,6 +119,19 @@ New:
 - `memory_list(scope?, tags?, stale?, limit?)` — filtered browse (tags AND)
 - `memory_merge(targetId, sourceIds[], text?, tags?)` — merge duplicates; tags default to the union
 
+Prefer searching for an existing fact/topic before writing when its identity is not
+already known. A changed state of the **same fact** belongs in `memory_update`, not
+another write or a forced near-duplicate. Similarity does not prove equivalence or
+contradiction; review the candidates. This is guidance, not a mandatory extra search
+call or a new length restriction.
+
+Successful pinned writes and relevant updates include optional `budget`
+feedback: actual rendered characters, optional configured-tokenizer tokens, selected,
+omitted and truncated IDs from the renderer itself. The calculation uses current
+visible scopes, recent-count and escape/budget configuration—not whole-database text
+length. Duplicate-rejected writes do not claim a new pinned budget. Rendering failure
+after a successful mutation is reported separately; the saved ID remains successful.
+
 ## Scale and limitations
 
 Near-duplicate detection scans all memories in the same scope on each non-forced `memory_write`. This design targets personal long-term fact stores rather than large document collections. Write cost grows with the number and length of memories in that scope; no benchmark-backed capacity limit is currently documented.
@@ -133,6 +147,50 @@ npx -p @tr1v3r/dsh-ltm dsh-ltm --db /path/to/ltm.db <command> [--json]
 `list / search / show / edit / tag / pin / merge / confirm / export / import / migrate` — every command supports `--json` for machine-readable output. Unknown flags, mutually exclusive flags, and surplus positional arguments are rejected. Default database: `$DSH_HOME/memory/ltm.db`.
 
 `export` emits `dsh-ltm-export/1`; `import` validates the complete payload and restores IDs, timestamps, normalized tags, scope, pinned state, and stale lifecycle. Re-importing an identical ID is skipped; an ID whose stored value differs aborts the entire import without partial writes.
+
+### Read-only quality doctor
+
+```sh
+dsh-ltm --db /path/to/ltm.db doctor --json
+dsh-ltm doctor --config /path/to/ltm-config.json --scope 'git:…' --max-pairs 100000 --json
+```
+
+`doctor` opens an **existing** database with SQLite `readOnly: true`, never via
+`MemoryStore`: no creation, journal-mode change, FTS rebuild, migration, confirmation
+or cleanup. Missing files/parent directories and incompatible schemas fail loudly.
+It reads a consistent base-row snapshot, including committed WAL data. FTS health
+is explicitly not checked or repaired; old token versions do not prevent analysis.
+
+Both output modes omit all memory text and tags. Findings contain IDs, rule names,
+reasons, lengths/similarities only. Inspect prose deliberately using `show`/`list`.
+Rules are advisory: long entries (UTF-16 threshold printed in the report), suspected
+temporary-state/path cues and possible project-specific global entries are **not**
+authority to delete, relocate or shorten anything. Global project cues cannot identify
+the owning project. Arbitrary `#123` text is not treated as a memory reference: no
+reference check is performed without a reliable syntax.
+
+Analysis and scope distribution cover the **whole database**. Prompt accounting is
+separate: by default it uses CLI cwd-derived project + global, or only `defaultScope`
+when `autoProjectScope: false`. `--scope S` overrides the active prompt scope, not the
+audit population (with automatic mode off it remains fixed-scope-only). All selected
+scopes are printed. Selection/order/recent limits and budgets match the actual prompt
+renderer, including metadata, escaping, header, notices and truncation; IDs are tracked
+structurally rather than parsed out of potentially multiline memory text.
+
+The CLI **does not load a live profile**. Without `--config`, reported budgets are
+package defaults, not a claim about deployed settings. `--config` accepts a JSON
+object of the same plugin configuration keys (including `promptMaxChars`, paired
+`promptMaxTokens`/`promptTokenizerPath`, `promptRecentCount`, `escapeSequences` and
+scope/dedupe settings); `--db` overrides its path. Relative paths resolve from CLI cwd.
+Database path and configuration source are printed, never the full configuration.
+Token counts have the same offline-tokenizer limitations described above.
+
+Same-scope near-duplicate analysis is quadratic in the number of records (also
+sensitive to text length), capped at 100,000 pair comparisons by default. Raise
+`--max-pairs N` as needed; total, compared, skipped and `complete` are always explicit,
+so an incomplete scan cannot silently claim coverage. Similarity is lexical evidence,
+not contradiction detection. No embeddings, automatic cleanup, schema changes or
+background LLM calls are introduced.
 
 ### Migrating from dsh-memory
 

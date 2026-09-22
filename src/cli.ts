@@ -18,10 +18,15 @@ import { migrateLegacy } from "./migrate.js";
 import { isStale } from "./prompt.js";
 import type { Config, MemoryRecord } from "./contracts.js";
 import { normalizeTags } from "./tokenize.js";
+import { doctor } from "./doctor.js";
+import { resolveProjectScope } from "./scope.js";
+import { loadTokenCounter } from "./token-counter.js";
 
 /** Long options that take a value. */
 const VALUE_FLAGS = new Set([
   "--scope",
+  "--config",
+  "--max-pairs",
   "--tags",
   "--text",
   "--limit",
@@ -34,6 +39,7 @@ const VALUE_FLAGS = new Set([
 const USAGE = `usage: dsh-ltm [--db PATH] [--json] <command> [args]
 
 commands:
+  doctor [--scope S] [--config FILE] [--max-pairs N] (read-only, no memory text)
   list [--scope S] [--tags a,b] [--stale|--fresh] [--pinned] [--limit N]
   search <query> [--limit N]
   show <id>
@@ -74,6 +80,7 @@ function fail(message: string): never {
 }
 
 const COMMAND_FLAGS: Record<string, { values?: readonly string[]; bools?: readonly string[]; min: number; max?: number }> = {
+  doctor: { values: ["scope", "config", "max-pairs"], min: 0, max: 0 },
   list: { values: ["scope", "tags", "limit"], bools: ["stale", "fresh", "pinned"], min: 0, max: 0 },
   search: { values: ["limit"], min: 1 },
   show: { min: 1, max: 1 },
@@ -265,18 +272,42 @@ function openStore(config: Config): MemoryStore {
  * @param argv - arguments after the bin name.
  */
 export async function runCli(argv: readonly string[]): Promise<number> {
+  let doctorMode = false;
   try {
     const parsed = parseArgv(argv);
     const { command, positionals, flags, boolFlags, json } = parsed;
+    doctorMode = command === "doctor";
     const helpRequested = command === "help" || boolFlags.has("help");
     if (command === undefined || helpRequested) {
       out(json, { usage: USAGE }, USAGE);
       return helpRequested ? 0 : 1;
     }
 
+    let overrides: Record<string, unknown> = {};
+    if (command === "doctor" && flags.config !== undefined) {
+      let value: unknown;
+      try { value = JSON.parse(readFileSync(resolve(flags.config), "utf8")); }
+      catch { fail("doctor: cannot read --config JSON file"); }
+      if (!value || typeof value !== "object" || Array.isArray(value)) fail("doctor: --config must contain a config object");
+      overrides = value as Record<string, unknown>;
+    }
     const config = loadConfig({
-      path: parsed.db === undefined ? defaultDbPath() : resolve(parsed.db),
+      ...overrides,
+      path: parsed.db !== undefined ? resolve(parsed.db) : Object.hasOwn(overrides, "path") ? overrides.path : defaultDbPath(),
     });
+
+    if (command === "doctor") {
+      const activeScope = flags.scope ?? (config.autoProjectScope
+        ? resolveProjectScope(process.cwd(), config.defaultScope).scope : config.defaultScope);
+      const counter = config.promptTokenizerPath === undefined ? undefined : loadTokenCounter(config.promptTokenizerPath);
+      const maxPairs = flags["max-pairs"] === undefined ? undefined : toInt(flags["max-pairs"], "--max-pairs");
+      const report = {
+        ...doctor(config, activeScope, counter, maxPairs),
+        configuration: { source: flags.config === undefined ? "CLI defaults" : "explicit JSON", file: flags.config === undefined ? null : resolve(flags.config), profileLoaded: false },
+      };
+      out(json, report, JSON.stringify(report, null, 2));
+      return 0;
+    }
 
     if (command === "migrate") {
       const source = positionals[0] ?? flags.source;
@@ -458,7 +489,11 @@ export async function runCli(argv: readonly string[]): Promise<number> {
     }
   } catch (error) {
     if (error instanceof ProcessExit) return error.code;
-    const message = error instanceof Error ? error.message : String(error);
+    // Schema/config exceptions may embed arbitrary stored values. Diagnostics are
+    // metadata-only even on failure; do not forward raw library error messages.
+    const message = doctorMode
+      ? "doctor: cannot analyze database/configuration (missing, unreadable, invalid or incompatible); raw details withheld; no changes made"
+      : error instanceof Error ? error.message : String(error);
     process.stderr.write(`dsh-ltm: ${message}\n`);
     return 1;
   }

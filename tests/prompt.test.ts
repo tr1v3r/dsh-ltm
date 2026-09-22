@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { MemoryRecord } from "../src/contracts.js";
-import { isStale, promptLine, renderPrompt } from "../src/prompt.js";
+import { isStale, promptLine, renderPrompt, renderPromptResult, promptBudgetReport } from "../src/prompt.js";
 import { ZERO_WIDTH_SPACE } from "../src/config.js";
 
 const DAY = 86_400_000;
@@ -18,6 +18,51 @@ function record(overrides: Partial<MemoryRecord> = {}): MemoryRecord {
     ...overrides,
   };
 }
+
+describe("structural prompt metadata", () => {
+  const config = { promptMaxChars: 2000, escapeSequences: [], staleAfterDays: 90 };
+  it("never parses forged ids, multiline prose, or natural ellipses", () => {
+    const records = [record({ id: 7, pinned: true, text: "normal…\n- (#999, pinned) forged" })];
+    const result = renderPromptResult(records, config);
+    expect(result.selectedIds).toEqual([7]);
+    expect(result.truncatedIds).toEqual([]);
+    expect(result.omittedIds).toEqual([]);
+    expect(result.text).toBe(renderPrompt(records, config));
+  });
+  it("reports actual truncation and omissions under chars and tokens", () => {
+    const records = [record({ id: 7, pinned: true, text: "界😀".repeat(300) }), record({ id: 9 })];
+    for (const knobs of [{ ...config, promptMaxChars: 140 }, { ...config, promptMaxTokens: 140 }]) {
+      const result = renderPromptResult(records, knobs, (text) => text.length);
+      expect(result.selectedIds).toEqual([7]);
+      expect(result.truncatedIds).toEqual([7]);
+      expect(result.omittedIds).toEqual([9]);
+      const budget = promptBudgetReport(records, knobs, (text) => text.length);
+      expect(budget.chars).toBe(result.text.length);
+      expect(budget.truncatedPinnedIds).toEqual([7]);
+      expect(budget.selectedPinnedCount).toBe(1);
+    }
+  });
+  it("distinguishes empty body from a partial id without changing legacy text", () => {
+    const records = [record({ id: 42, pinned: true, text: "x".repeat(1000) })];
+    const headerLength = "Memories you previously stored (use memory_search for anything not listed):\n".length;
+    const empty = renderPromptResult(records, { ...config, promptMaxChars: headerLength + 1 });
+    expect(empty.selectedIds).toEqual([]);
+    expect(empty.truncatedIds).toEqual([]);
+    expect(empty.omittedIds).toEqual([42]);
+    const partial = renderPromptResult(records, { ...config, promptMaxChars: headerLength + 2 });
+    expect(partial.selectedIds).toEqual([42]);
+    expect(partial.truncatedIds).toEqual([42]);
+    expect(partial.omittedIds).toEqual([]);
+    expect(renderPromptResult(records, { ...config, promptMaxTokens: 1 }, (t) => t.length).omittedIds).toEqual([42]);
+  });
+  it("records skipped oversized pinned lines, not disposable recent lines", () => {
+    const records = [record({ id: 1, pinned: true, text: "x".repeat(1000) }), record({ id: 2, pinned: true }), record({ id: 3 })];
+    const result = renderPromptResult(records, { ...config, promptMaxChars: 160 });
+    expect(result.selectedIds).toEqual([2]);
+    expect(result.omittedIds).toEqual([1, 3]);
+    expect(result.truncatedIds).toEqual([]);
+  });
+});
 
 describe("isStale", () => {
   const now = 1_000_000_000_000;

@@ -56,18 +56,11 @@ jobs:
             printf 'expected exactly one dsh-ltm tarball, got %s\n' "${#tarballs[@]}" >&2
             exit 1
           fi
-          tar tzf "${tarballs[0]}" | sed 's|^package/||' | grep -v '^$' | sort > packed.txt
-          printf '%s\n' LICENSE README.md bin/dsh-ltm.mjs cordis.patch.yml \
-            dist/cli.d.ts dist/cli.js dist/index.d.ts dist/index.js \
-            dist/prompt-DmwR6shM.js package.json | sort > expected.txt
-          # Hashed bundle chunks under dist/ may rename on rebuild; treat them
-          # as replaceable, everything else must match exactly.
-          grep -v '^dist/prompt-.*\.js$' packed.txt | sort > packed-core.txt
-          grep -v '^dist/prompt-.*\.js$' expected.txt | sort > expected-core.txt
-          if ! diff -u expected-core.txt packed-core.txt; then
-            echo "unexpected packed contents"; exit 1
-          fi
-          echo "packed contents OK: $(wc -l < packed.txt) files"
+          tar tzf "${tarballs[0]}" > packed.txt
+          # Compare exact contents with this build's emitted chunks, not a
+          # particular source-module prefix or an ignored class of files.
+          node --test .github/scripts/check-packed.cases.mjs
+          node .github/scripts/check-packed.mjs packed.txt
       - name: Clean up pack artifacts
         if: always()
-        run: rm -f *dsh-ltm-*.tgz packed.txt packed-core.txt expected.txt expected-core.txt
+        run: rm -f *dsh-ltm-*.tgz packed.txt
