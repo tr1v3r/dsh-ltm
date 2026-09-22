@@ -19,6 +19,9 @@ import {
   type WriteToolOutput,
 } from "./tools.js";
 import { promptLine, renderPrompt } from "./prompt.js";
+import { loadTokenCounter } from "./token-counter.js";
+export { loadTokenCounter } from "./token-counter.js";
+export type { TokenCounter } from "./contracts.js";
 
 export const name = "ltm";
 export const inject = ["tools", "systemPrompt"];
@@ -47,6 +50,10 @@ const MERGE_DESCRIPTION =
  */
 export function apply(ctx: Context, rawConfig: unknown) {
   const config = loadConfig(rawConfig);
+  // Fail before opening SQLite or registering any effects/tools. Default mode
+  // never resolves/imports the optional tokenizer dependency.
+  const tokenCounter = config.promptTokenizerPath === undefined
+    ? undefined : loadTokenCounter(config.promptTokenizerPath);
   let store: MemoryStore | undefined;
   ctx.effect(() => {
     store = new MemoryStore(config.path, {
@@ -87,7 +94,7 @@ export function apply(ctx: Context, rawConfig: unknown) {
     name: "ltm:recall",
     order: config.promptOrder,
     // Always read through the fiber-scoped store, never a captured handle.
-    text: () => renderPrompt(open().forPrompt(config.promptRecentCount), config),
+    text: () => renderPrompt(open().forPrompt(config.promptRecentCount), config, tokenCounter),
   });
 
   ctx.tools.register(
