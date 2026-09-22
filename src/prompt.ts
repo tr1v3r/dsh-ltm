@@ -3,8 +3,8 @@
  *
  * Pinned records always render first; unpinned recent ones follow; the whole
  * section lives under a character budget so a too-large store degrades by
- * dropping recent lines, never pinned ones (R9). Memory text is escaped for
- * configured template-injection sequences before rendering.
+ * dropping recent lines, never pinned ones (R9). Memory text is preserved by
+ * default; deployments may explicitly configure output sequences to break.
  *
  * @module dsh-ltm/prompt
  */
@@ -23,8 +23,8 @@ const HEADER =
  * `memory_confirm` review so the model can refresh them opportunistically.
  *
  * @param record - the memory to render.
- * @param escapeSequences - sequences broken with a zero-width space.
- * @returns a single line carrying id, flags, tags, and escaped text.
+ * @param escapeSequences - opt-in output sequences broken with a zero-width space.
+ * @returns a single line carrying id, flags, tags, and rendered text.
  */
 export function promptLine(
   record: MemoryRecord,
