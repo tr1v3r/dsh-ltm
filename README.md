@@ -9,10 +9,19 @@ Structured long-term memory for [DeepSeek Harness](https://github.com/deepseek-a
 
 ## Install into a profile
 
-The plugin ships a bundle patch (`cordis.patch.yml`) so a profile installs it as an inserted entry:
+With `@tr1v3r/dsh-ltm` **0.1.2 or newer**, install and register the bundled configuration in one command:
+
+```sh
+dsh plugin --profile web add @tr1v3r/dsh-ltm
+```
+
+Replace `web` with your profile name (for example `dsh-tui`), then restart that profile. The bundle sets the database path to `$DSH_HOME/memory/ltm.db`; no API key or embedding service is needed.
+
+When replacing `dsh-memory`, disable its existing entry first: both plugins register `memory_write`, `memory_search`, and `memory_forget`. If you already inserted an `ltm` entry manually, remove that manual insert before enabling the bundle to avoid duplicate instances. Installing does not migrate the old database automatically; see [Migrating from dsh-memory](#migrating-from-dsh-memory).
+
+For manual composition (including versions 0.1.0–0.1.1, which lack the bundle manifest), install the npm dependency and insert the following into the profile's `cordis.patch.yml` instead of enabling the bundle:
 
 ```yaml
-# in the profile's cordis.patch.yml (or via `dsh plugin`)
 - insert:
     - id: ltm
       name: '@tr1v3r/dsh-ltm'

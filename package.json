@@ -1,6 +1,6 @@
 {
   "name": "@tr1v3r/dsh-ltm",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Structured long-term memory for DeepSeek Harness: CJK-aware tokenized search, hybrid rerank, dedupe, expiry review, and migration from dsh-memory — zero mandatory network",
   "keywords": [
     "dsh",
@@ -19,6 +19,11 @@
   },
   "engines": {
     "node": "^22.19.0 || >=24.0.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
   },
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
