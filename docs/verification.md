@@ -38,7 +38,7 @@ createLaunchEnvironmentSnapshot([...process.env]))`。收尾用 `ctx.fiber.dispo
 ## 3. 迁移端到端（真实旧库）
 
 旧库：`~/.config/dsh/memory/memory.db`（真实 dsh-memory 库，含 wal/shm）。先整体拷贝到
-`/tmp` 临时目录，再 `node bin/dsh-ltm.mjs migrate <copy> --db <tmp>/ltm.db --json`：
+`/tmp` 临时目录，再 `pnpm exec tsx scripts/legacy-migration/cli.ts --source <copy> --db <tmp>/ltm.db`（历史记录：当时经 `dsh-ltm migrate` 执行；该子命令现退役为仓库内脚本）：
 
 - **80/80 迁移成功**，dedupedCount=0，failures=[]；
 - **原库未被触碰**：migrate 前后 `memory.db` 与 `memory.db-wal` 的 sha256 逐一不变；
@@ -66,6 +66,6 @@ P1（核心引擎）+ P1'（插件面）联合验证通过：全测试矩阵绿�
 pnpm typecheck && pnpm test && pnpm build
 node probe/boot-probe.mjs                       # 真实 boot 探针（21 断言）
 cp ~/.config/dsh/memory/memory.db* /tmp/ltm-src/
-node bin/dsh-ltm.mjs migrate /tmp/ltm-src/memory.db --db /tmp/ltm-src/ltm.db --json
+pnpm exec tsx scripts/legacy-migration/cli.ts --source /tmp/ltm-src/memory.db --db /tmp/ltm-src/ltm.db
 node bin/dsh-ltm.mjs search "数据库" --db /tmp/ltm-src/ltm.db --json
 ```

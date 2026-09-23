@@ -6,7 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { migrateLegacy } from "../src/migrate.js";
+import { migrateLegacy } from "../scripts/legacy-migration/migrate.js";
 import { MemoryStore } from "../src/store.js";
 
 const dirs: string[] = [];

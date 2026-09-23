@@ -1,9 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { createHash } from "node:crypto";
 import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
 import { runCli } from "../src/cli.js";
 import { MemoryStore } from "../src/store.js";
 
@@ -38,54 +36,21 @@ const stdout = () => chunks.join("");
 /** Clear captured output so the next JSON.parse sees only one command's output. */
 const resetOut = () => { chunks.length = 0; errChunks.length = 0; };
 
-/** Build a legacy dsh-memory-format database (SCHEMA_VERSION=1). */
-function legacyFixture(pinOne = false): string {
-  const legacyPath = join(dir, "memory.db");
-  const legacy = new DatabaseSync(legacyPath);
-  legacy.exec(`
-    CREATE TABLE memories (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      text TEXT NOT NULL,
-      tags TEXT NOT NULL DEFAULT '',
-      pinned INTEGER NOT NULL DEFAULT 0,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL
-    );
-    CREATE VIRTUAL TABLE memories_fts
-      USING fts5(text, tags, content='memories', content_rowid='id');
-  `);
-  const rows: [string, string, number][] = [
-    ["legacy preference: use pnpm", "preference build", pinOne ? 1 : 0],
-    ["旧的中文记忆：跨会话记忆很重要", "", 0],
-    ["legacy convention: escape {{ before templating", "safety", 0],
-  ];
-  for (const [text, tags, pinned] of rows) {
-    legacy
-      .prepare(
-        "INSERT INTO memories (text, tags, pinned, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-      )
-      .run(text, tags, pinned, 1_000, 2_000);
-  }
-  legacy.exec(
-    "INSERT INTO memories_fts (rowid, text, tags) SELECT id, text, tags FROM memories",
-  );
-  legacy.exec("PRAGMA user_version = 1");
-  legacy.close();
-  return legacyPath;
-}
-
 describe("cli", () => {
   it("help subcommand and --help both exit 0", async () => {
     expect(await runCli(["help"])).toBe(0);
     expect(stdout()).toContain("usage:");
+    expect(stdout()).not.toContain("migrate");
     resetOut();
     expect(await runCli(["--help"])).toBe(0);
     expect(stdout()).toContain("usage:");
+    expect(stdout()).not.toContain("migrate");
   });
 
   it("--help after a subcommand also exits 0", async () => {
     expect(await runCli(["--db", db(), "list", "--help"])).toBe(0);
     expect(stdout()).toContain("usage:");
+    expect(stdout()).not.toContain("migrate");
   });
 
   it("write-then-search-list-show-edit-tag-pin-confirm lifecycle", async () => {
@@ -257,23 +222,43 @@ describe("cli", () => {
     expect(await runCli(["--db", db(), "import", file])).toBe(1);
   });
 
-  it("migrate copies the fixture, leaves the source untouched", async () => {
-    const legacyPath = legacyFixture(true);
-    const before = createHash("sha256").update(readFileSync(legacyPath)).digest("hex");
-    resetOut();
-    expect(await runCli(["--db", db(), "migrate", legacyPath, "--json"])).toBe(0);
-    const report = JSON.parse(stdout());
-    expect(report.sourceCount).toBe(3);
-    expect(report.migratedCount).toBe(3);
-    expect(report.failures).toHaveLength(0);
-    const after = createHash("sha256").update(readFileSync(legacyPath)).digest("hex");
-    expect(after).toBe(before);
+  it("rejects retired migrate without creating a destination directory or database", async () => {
+    const destinationDir = join(dir, "must-not-create");
+    const destination = join(destinationDir, "ltm.db");
+    const source = join(dir, "legacy.db");
+    for (const args of [
+      ["migrate", source, "--json"],
+      ["migrate", "--source", source],
+      ["migrate", `--source=${source}`],
+      ["migrate", "--help"],
+      ["migrate"],
+    ]) {
+      resetOut();
+      expect(await runCli(["--db", destination, ...args])).toBe(1);
+      expect(stdout()).toBe("");
+      expect(errChunks.join("")).toContain("retired");
+      expect(errChunks.join("")).toContain("scripts/legacy-migration/README.md");
+      expect(existsSync(destinationDir)).toBe(false);
+      expect(existsSync(destination)).toBe(false);
+      expect(existsSync(source)).toBe(false);
+    }
+  });
 
-    // Pinned legacy memory survives and is searchable (CJK too).
-    expect(await runCli(["--db", db(), "list", "--pinned"])).toBe(0);
-    expect(stdout()).toContain("legacy preference: use pnpm");
-    expect(await runCli(["--db", db(), "search", "跨会话"])).toBe(0);
-    expect(stdout()).toContain("旧的中文记忆");
+  it("rejects retired migrate without changing existing database or committed WAL bytes", async () => {
+    const writer = new MemoryStore(db());
+    try {
+      const original = writer.write("keep committed memory", [], { pinned: true }).record;
+      const files = [db(), db() + "-wal", db() + "-shm"];
+      const before = files.map((file) => readFileSync(file));
+      expect(await runCli(["--db", db(), "migrate", db(), "--json"])).toBe(1);
+      expect(stdout()).toBe("");
+      expect(errChunks.join("")).toContain("scripts/legacy-migration/README.md");
+      // No connection is opened, so even SHM bytes remain unchanged.
+      for (const [index, file] of files.entries()) {
+        expect(readFileSync(file)).toEqual(before[index]);
+      }
+      expect(writer.list()).toEqual([original]);
+    } finally { writer.close(); }
   });
 
   it("rejects unknown, mutually exclusive, and surplus arguments", async () => {

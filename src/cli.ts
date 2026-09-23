@@ -2,7 +2,7 @@
  * CLI (P1' surface): `dsh-ltm [--db PATH] [--json] <command> ...`
  *
  * Commands: list / search / show / edit / tag / pin / merge / confirm /
- * export / import / migrate (R7). Every command prints JSON with `--json` and
+ * export / import. Every command prints JSON with `--json` and
  * a human-readable summary otherwise. The CLI never logs config values or
  * anything beyond the memory records the operator explicitly asked for.
  *
@@ -14,7 +14,6 @@ import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { loadConfig } from "./config.js";
 import { MemoryStore } from "./store.js";
-import { migrateLegacy } from "./migrate.js";
 import { isStale } from "./prompt.js";
 import type { Config, MemoryRecord } from "./contracts.js";
 import { normalizeTags } from "./tokenize.js";
@@ -31,7 +30,6 @@ const VALUE_FLAGS = new Set([
   "--text",
   "--limit",
   "--file",
-  "--source",
   "--out",
 ]);
 
@@ -50,7 +48,6 @@ commands:
   confirm <id>|--all
   export [--out <file>]          (JSON to stdout or a new file; never overwrites)
   import <file>                  (JSON produced by export)
-  migrate <legacyDbPath>         (legacy dsh-memory db, read-only)
   help
 
 global:
@@ -91,7 +88,6 @@ const COMMAND_FLAGS: Record<string, { values?: readonly string[]; bools?: readon
   confirm: { bools: ["all"], min: 0, max: 1 },
   export: { values: ["out"], min: 0, max: 0 },
   import: { min: 1, max: 1 },
-  migrate: { values: ["source"], min: 0, max: 1 },
   help: { min: 0, max: 0 },
 };
 
@@ -138,6 +134,11 @@ function parseArgv(argv: readonly string[]): ParsedArgs {
       if (inlineValue !== undefined) fail(`unknown flag ${name}`);
       parsed.boolFlags.add(arg.slice(2));
     } else if (parsed.command === undefined) {
+      // Reject the retired command before config/database access, even with old
+      // migration flags or --help. Migration is a repo-only, one-shot utility.
+      if (arg === "migrate") {
+        fail("migrate has been retired from the production CLI; use the repo-only one-shot utility described in scripts/legacy-migration/README.md");
+      }
       parsed.command = arg;
     } else {
       parsed.positionals.push(arg);
@@ -165,9 +166,6 @@ function parseArgv(argv: readonly string[]): ParsedArgs {
       }
       if (parsed.command === "confirm" && parsed.boolFlags.has("all") && parsed.positionals.length > 0) {
         fail("confirm: <id> and --all are mutually exclusive");
-      }
-      if (parsed.command === "migrate" && parsed.flags.source !== undefined && parsed.positionals.length > 0) {
-        fail("migrate: <legacyDbPath> and --source are mutually exclusive");
       }
     }
   }
@@ -337,25 +335,6 @@ export async function runCli(argv: readonly string[]): Promise<number> {
       };
       out(json, report, JSON.stringify(report, null, 2));
       return 0;
-    }
-
-    if (command === "migrate") {
-      const source = positionals[0] ?? flags.source;
-      if (source === undefined) fail("migrate: missing <legacyDbPath>");
-      const store = openStore(config);
-      try {
-        const report = migrateLegacy(resolve(source), store);
-        out(
-          json,
-          report,
-          `migrated ${report.migratedCount}/${report.sourceCount} from ${report.sourcePath}` +
-            (report.dedupedCount > 0 ? ` (${report.dedupedCount} deduped)` : "") +
-            (report.failures.length > 0 ? `, ${report.failures.length} failed` : ""),
-        );
-        return report.failures.length > 0 ? 1 : 0;
-      } finally {
-        store.close();
-      }
     }
 
     const store = openStore(config);

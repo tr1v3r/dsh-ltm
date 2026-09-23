@@ -10,7 +10,7 @@
  * source main database and its `-wal` untouched — verified by tests via sha256
  * before/after. Opening even read-only can still update the `-shm` sidecar.
  *
- * @module dsh-ltm/migrate
+ * Repository-only, one-shot migration utility; not part of the npm package.
  */
 
 import { mkdtempSync, rmSync } from "node:fs";
@@ -18,9 +18,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-import type { MigrationReport } from "./contracts.js";
-import { normalizeTags } from "./tokenize.js";
-import type { MemoryStore } from "./store.js";
+import type { MigrationReport } from "../../src/contracts.js";
+import { normalizeTags } from "../../src/tokenize.js";
+import type { MemoryStore } from "../../src/store.js";
 
 interface LegacyRow {
   id: number;
@@ -38,7 +38,7 @@ interface LegacyRow {
  * (including when the caller supplies the destination itself as the source).
  * The derived legacy FTS index/triggers are not needed to import base rows.
  */
-function assertLegacySource(db: DatabaseSync): void {
+export function assertLegacySource(db: DatabaseSync): void {
   const table = db.prepare("SELECT type FROM sqlite_schema WHERE name = 'memories'").get();
   const columns = db.prepare("PRAGMA table_xinfo(memories)").all();
   const expected = [
