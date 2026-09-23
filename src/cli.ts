@@ -2,19 +2,18 @@
  * CLI (P1' surface): `dsh-ltm [--db PATH] [--json] <command> ...`
  *
  * Commands: list / search / show / edit / tag / pin / merge / confirm /
- * export / import / migrate (R7). Every command prints JSON with `--json` and
+ * export / import. Every command prints JSON with `--json` and
  * a human-readable summary otherwise. The CLI never logs config values or
  * anything beyond the memory records the operator explicitly asked for.
  *
  * @module dsh-ltm/cli
  */
 
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { loadConfig } from "./config.js";
 import { MemoryStore } from "./store.js";
-import { migrateLegacy } from "./migrate.js";
 import { isStale } from "./prompt.js";
 import type { Config, MemoryRecord } from "./contracts.js";
 import { normalizeTags } from "./tokenize.js";
@@ -31,7 +30,6 @@ const VALUE_FLAGS = new Set([
   "--text",
   "--limit",
   "--file",
-  "--source",
   "--out",
 ]);
 
@@ -48,9 +46,8 @@ commands:
   pin <id> [--off]
   merge <targetId> <sourceId>... [--text <text>] [--tags a,b]
   confirm <id>|--all
-  export [--out <file>]          (JSON to stdout or file)
+  export [--out <file>]          (JSON to stdout or a new file; never overwrites)
   import <file>                  (JSON produced by export)
-  migrate <legacyDbPath>         (legacy dsh-memory db, read-only)
   help
 
 global:
@@ -91,7 +88,6 @@ const COMMAND_FLAGS: Record<string, { values?: readonly string[]; bools?: readon
   confirm: { bools: ["all"], min: 0, max: 1 },
   export: { values: ["out"], min: 0, max: 0 },
   import: { min: 1, max: 1 },
-  migrate: { values: ["source"], min: 0, max: 1 },
   help: { min: 0, max: 0 },
 };
 
@@ -138,6 +134,11 @@ function parseArgv(argv: readonly string[]): ParsedArgs {
       if (inlineValue !== undefined) fail(`unknown flag ${name}`);
       parsed.boolFlags.add(arg.slice(2));
     } else if (parsed.command === undefined) {
+      // Reject the retired command before config/database access, even with old
+      // migration flags or --help. Migration is a repo-only, one-shot utility.
+      if (arg === "migrate") {
+        fail("migrate has been retired from the production CLI; use the repo-only one-shot utility described in scripts/legacy-migration/README.md");
+      }
       parsed.command = arg;
     } else {
       parsed.positionals.push(arg);
@@ -165,9 +166,6 @@ function parseArgv(argv: readonly string[]): ParsedArgs {
       }
       if (parsed.command === "confirm" && parsed.boolFlags.has("all") && parsed.positionals.length > 0) {
         fail("confirm: <id> and --all are mutually exclusive");
-      }
-      if (parsed.command === "migrate" && parsed.flags.source !== undefined && parsed.positionals.length > 0) {
-        fail("migrate: <legacyDbPath> and --source are mutually exclusive");
       }
     }
   }
@@ -255,6 +253,36 @@ function out(json: boolean, data: unknown, human: string): void {
   }
 }
 
+/** Never truncate an existing file (including hardlinks/symlinks to SQLite).
+ * Reserve absent SQLite sidecars too: creating JSON at a future WAL/journal path
+ * would break the next database writer. Canonicalize parent-directory aliases.
+ */
+function writeExportFile(file: string, payload: string, dbPath: string): void {
+  // Resolve the raw parent through the filesystem before normalizing: lexical
+  // resolve() would collapse a symlink/.. pair to the wrong directory.
+  const output = join(realpathSync.native(dirname(file)), basename(file));
+  const databasePaths = [resolve(dbPath), realpathSync.native(dbPath)];
+  const filenameKey = (path: string) => path.normalize("NFC").toLowerCase();
+  for (const database of databasePaths) {
+    const canonical = join(realpathSync(dirname(database)), basename(database));
+    // Reserve case/Unicode-normalization variants conservatively even on
+    // case-sensitive hosts, covering absent filename aliases on macOS too.
+    if (["", "-wal", "-shm", "-journal"].some((suffix) => filenameKey(output) === filenameKey(canonical + suffix))) {
+      fail("export: --out must not target the database or its SQLite sidecars");
+    }
+  }
+  try {
+    // Exclusive creation also closes the check-then-truncate race and rejects
+    // dangling symlinks without following them.
+    writeFileSync(output, payload, { encoding: "utf8", flag: "wx" });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      fail("export: --out already exists; choose a new file (existing files are never overwritten)");
+    }
+    throw error;
+  }
+}
+
 function openStore(config: Config): MemoryStore {
   return new MemoryStore(config.path, {
     staleAfterDays: config.staleAfterDays,
@@ -307,25 +335,6 @@ export async function runCli(argv: readonly string[]): Promise<number> {
       };
       out(json, report, JSON.stringify(report, null, 2));
       return 0;
-    }
-
-    if (command === "migrate") {
-      const source = positionals[0] ?? flags.source;
-      if (source === undefined) fail("migrate: missing <legacyDbPath>");
-      const store = openStore(config);
-      try {
-        const report = migrateLegacy(resolve(source), store);
-        out(
-          json,
-          report,
-          `migrated ${report.migratedCount}/${report.sourceCount} from ${report.sourcePath}` +
-            (report.dedupedCount > 0 ? ` (${report.dedupedCount} deduped)` : "") +
-            (report.failures.length > 0 ? `, ${report.failures.length} failed` : ""),
-        );
-        return report.failures.length > 0 ? 1 : 0;
-      } finally {
-        store.close();
-      }
     }
 
     const store = openStore(config);
@@ -464,7 +473,7 @@ export async function runCli(argv: readonly string[]): Promise<number> {
           if (outFile === undefined) {
             process.stdout.write(payload + "\n");
           } else {
-            writeFileSync(outFile, payload, "utf8");
+            writeExportFile(outFile, payload, config.path);
             out(
               json,
               { exported: records.length, file: outFile },

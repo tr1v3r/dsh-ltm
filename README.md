@@ -144,9 +144,11 @@ Multiple sessions on one personal PC or server can share a local WAL database. O
 npx -p @tr1v3r/dsh-ltm dsh-ltm --db /path/to/ltm.db <command> [--json]
 ```
 
-`list / search / show / edit / tag / pin / merge / confirm / export / import / migrate` — every command supports `--json` for machine-readable output. Unknown flags, mutually exclusive flags, and surplus positional arguments are rejected. Default database: `$DSH_HOME/memory/ltm.db`.
+`list / search / show / edit / tag / pin / merge / confirm / export / import` — every command supports `--json` for machine-readable output. Unknown flags, mutually exclusive flags, and surplus positional arguments are rejected. Default database: `$DSH_HOME/memory/ltm.db`.
 
-`export` emits `dsh-ltm-export/1`; `import` validates the complete payload and restores IDs, timestamps, normalized tags, scope, pinned state, and stale lifecycle. Re-importing an identical ID is skipped; an ID whose stored value differs aborts the entire import without partial writes.
+`export` emits `dsh-ltm-export/1`; `--out` must name a **new file**. Existing files (including symlinks and hardlinks) are never overwritten, and the active database and its SQLite sidecar paths are reserved even when absent. Choose a new backup filename for each export. Without `--out`, JSON goes to stdout; shell redirection is outside this protection, so never redirect to a database or an existing backup.
+
+`import` validates the complete payload and restores IDs, timestamps, normalized tags, scope, pinned state, and stale lifecycle. Re-importing an identical ID is skipped; an ID whose stored value differs aborts the entire import without partial writes.
 
 ### Read-only quality doctor
 
@@ -194,11 +196,11 @@ background LLM calls are introduced.
 
 ### Migrating from dsh-memory
 
-```sh
-dsh-ltm migrate ~/.config/dsh/memory/memory.db
-```
-
-The legacy database is opened read-only (copied to a temp location first); the original file is never modified and stays as the rollback. The command prints a `MigrationReport` (migrated / deduped / failures).
+The one-time import from the retired `dsh-memory` plugin lives in the
+repository, not in the published CLI (`scripts/legacy-migration/`; see its
+README). For backups and transfers between dsh-ltm databases use
+`export` / `import` instead: they preserve project scopes and review
+timestamps, which migration (a legacy-schema, global-scope mapping) does not.
 
 ## Development
 

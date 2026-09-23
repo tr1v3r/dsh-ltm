@@ -1,9 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
 import { runCli } from "../src/cli.js";
 import { MemoryStore } from "../src/store.js";
 
@@ -38,54 +36,21 @@ const stdout = () => chunks.join("");
 /** Clear captured output so the next JSON.parse sees only one command's output. */
 const resetOut = () => { chunks.length = 0; errChunks.length = 0; };
 
-/** Build a legacy dsh-memory-format database (SCHEMA_VERSION=1). */
-function legacyFixture(pinOne = false): string {
-  const legacyPath = join(dir, "memory.db");
-  const legacy = new DatabaseSync(legacyPath);
-  legacy.exec(`
-    CREATE TABLE memories (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      text TEXT NOT NULL,
-      tags TEXT NOT NULL DEFAULT '',
-      pinned INTEGER NOT NULL DEFAULT 0,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL
-    );
-    CREATE VIRTUAL TABLE memories_fts
-      USING fts5(text, tags, content='memories', content_rowid='id');
-  `);
-  const rows: [string, string, number][] = [
-    ["legacy preference: use pnpm", "preference build", pinOne ? 1 : 0],
-    ["旧的中文记忆：跨会话记忆很重要", "", 0],
-    ["legacy convention: escape {{ before templating", "safety", 0],
-  ];
-  for (const [text, tags, pinned] of rows) {
-    legacy
-      .prepare(
-        "INSERT INTO memories (text, tags, pinned, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-      )
-      .run(text, tags, pinned, 1_000, 2_000);
-  }
-  legacy.exec(
-    "INSERT INTO memories_fts (rowid, text, tags) SELECT id, text, tags FROM memories",
-  );
-  legacy.exec("PRAGMA user_version = 1");
-  legacy.close();
-  return legacyPath;
-}
-
 describe("cli", () => {
   it("help subcommand and --help both exit 0", async () => {
     expect(await runCli(["help"])).toBe(0);
     expect(stdout()).toContain("usage:");
+    expect(stdout()).not.toContain("migrate");
     resetOut();
     expect(await runCli(["--help"])).toBe(0);
     expect(stdout()).toContain("usage:");
+    expect(stdout()).not.toContain("migrate");
   });
 
   it("--help after a subcommand also exits 0", async () => {
     expect(await runCli(["--db", db(), "list", "--help"])).toBe(0);
     expect(stdout()).toContain("usage:");
+    expect(stdout()).not.toContain("migrate");
   });
 
   it("write-then-search-list-show-edit-tag-pin-confirm lifecycle", async () => {
@@ -149,6 +114,106 @@ describe("cli", () => {
     unchanged.close();
   });
 
+  it("rejects exports over the database and its file aliases without changing bytes", async () => {
+    const writer = new MemoryStore(db());
+    const original = writer.write("keep this memory", [], { pinned: true }).record;
+    writer.close();
+    const before = readFileSync(db());
+    const symlink = join(dir, "db-symlink.json");
+    const hardlink = join(dir, "db-hardlink.json");
+    symlinkSync(db(), symlink);
+    linkSync(db(), hardlink);
+    for (const output of [db(), symlink, hardlink]) {
+      resetOut();
+      expect(await runCli(["--db", db(), "export", "--out", output])).toBe(1);
+      expect(stdout()).toBe("");
+      expect(errChunks.join("")).toMatch(/database|already exists/);
+      expect(readFileSync(db())).toEqual(before);
+    }
+    const reopened = new MemoryStore(db());
+    try { expect(reopened.list()).toEqual([original]); }
+    finally { reopened.close(); }
+  });
+
+  it("preserves live WAL and SHM files when export targets them or their aliases", async () => {
+    const writer = new MemoryStore(db());
+    try {
+      writer.write("committed WAL memory", []);
+      const files = [db(), db() + "-wal", db() + "-shm"];
+      for (const file of files.slice(1)) {
+        const alias = file + ".json";
+        symlinkSync(file, alias);
+        for (const output of [file, alias]) {
+          const before = files.map((path) => readFileSync(path));
+          expect(await runCli(["--db", db(), "export", "--out", output])).toBe(1);
+          // SQLite read locks may update SHM; committed main/WAL bytes must not change.
+          expect(readFileSync(files[0]!)).toEqual(before[0]);
+          expect(readFileSync(files[1]!)).toEqual(before[1]);
+          expect(readFileSync(file).subarray(0, 1).toString()).not.toBe("{");
+        }
+      }
+      expect(writer.search("committed")).toHaveLength(1);
+    } finally { writer.close(); }
+  });
+
+  it("reserves absent SQLite sidecars through directory and database symlinks", async () => {
+    const writer = new MemoryStore(db());
+    writer.close();
+    const directoryAlias = join(dir, "alias");
+    symlinkSync(dir, directoryAlias, "dir");
+    const databaseAlias = join(dir, "database-alias.db");
+    symlinkSync(db(), databaseAlias);
+    for (const suffix of ["-wal", "-shm", "-journal"]) {
+      // An idle SQLite connection may create WAL/SHM while export runs, but the
+      // nonexistent journal path and both canonical/alias sidecar names are reserved.
+      for (const output of [db() + suffix, join(directoryAlias, "ltm.db" + suffix), databaseAlias + suffix]) {
+        expect(await runCli(["--db", databaseAlias, "export", "--out", output])).toBe(1);
+        expect(errChunks.join("")).toContain("SQLite sidecars");
+        expect(existsSync(output)).toBe(false);
+      }
+    }
+  });
+
+  it("reserves absent sidecars reached through symlink/.. or case variants", async () => {
+    const writer = new MemoryStore(db());
+    writer.close();
+    mkdirSync(join(dir, "child"));
+    mkdirSync(join(dir, "safe"));
+    symlinkSync(join(dir, "child"), join(dir, "safe", "link"), "dir");
+    // Do not use path.join here: it would collapse the symlink/.. pair.
+    const viaParent = `${dir}/safe/link/../ltm.db-journal`;
+    for (const output of [viaParent, join(dir, "LTM.DB-JOURNAL")]) {
+      resetOut();
+      expect(await runCli(["--db", db(), "export", "--out", output])).toBe(1);
+      expect(errChunks.join("")).toContain("SQLite sidecars");
+      expect(existsSync(output)).toBe(false);
+      expect(existsSync(db() + "-journal")).toBe(false);
+    }
+  });
+
+  it("reserves Unicode-normalization aliases of absent sidecar names", async () => {
+    const database = join(dir, "caf\u00e9.db");
+    const output = join(dir, "cafe\u0301.db-journal");
+    const writer = new MemoryStore(database);
+    writer.close();
+    expect(await runCli(["--db", database, "export", "--out", output])).toBe(1);
+    expect(errChunks.join("")).toContain("SQLite sidecars");
+    expect(existsSync(output)).toBe(false);
+    expect(existsSync(database + "-journal")).toBe(false);
+  });
+
+  it("does not overwrite existing exports or follow dangling output symlinks", async () => {
+    const output = join(dir, "existing.json");
+    writeFileSync(output, "previous backup");
+    expect(await runCli(["--db", db(), "export", "--out", output])).toBe(1);
+    expect(readFileSync(output, "utf8")).toBe("previous backup");
+    const target = join(dir, "must-not-create.json");
+    const alias = join(dir, "dangling.json");
+    symlinkSync(target, alias);
+    expect(await runCli(["--db", db(), "export", "--out", alias])).toBe(1);
+    expect(existsSync(target)).toBe(false);
+  });
+
   it("rejects malformed and unsupported import payloads", async () => {
     const file = join(dir, "bad.json");
     writeFileSync(file, JSON.stringify({ format: "other", records: [] }));
@@ -157,23 +222,43 @@ describe("cli", () => {
     expect(await runCli(["--db", db(), "import", file])).toBe(1);
   });
 
-  it("migrate copies the fixture, leaves the source untouched", async () => {
-    const legacyPath = legacyFixture(true);
-    const before = createHash("sha256").update(readFileSync(legacyPath)).digest("hex");
-    resetOut();
-    expect(await runCli(["--db", db(), "migrate", legacyPath, "--json"])).toBe(0);
-    const report = JSON.parse(stdout());
-    expect(report.sourceCount).toBe(3);
-    expect(report.migratedCount).toBe(3);
-    expect(report.failures).toHaveLength(0);
-    const after = createHash("sha256").update(readFileSync(legacyPath)).digest("hex");
-    expect(after).toBe(before);
+  it("rejects retired migrate without creating a destination directory or database", async () => {
+    const destinationDir = join(dir, "must-not-create");
+    const destination = join(destinationDir, "ltm.db");
+    const source = join(dir, "legacy.db");
+    for (const args of [
+      ["migrate", source, "--json"],
+      ["migrate", "--source", source],
+      ["migrate", `--source=${source}`],
+      ["migrate", "--help"],
+      ["migrate"],
+    ]) {
+      resetOut();
+      expect(await runCli(["--db", destination, ...args])).toBe(1);
+      expect(stdout()).toBe("");
+      expect(errChunks.join("")).toContain("retired");
+      expect(errChunks.join("")).toContain("scripts/legacy-migration/README.md");
+      expect(existsSync(destinationDir)).toBe(false);
+      expect(existsSync(destination)).toBe(false);
+      expect(existsSync(source)).toBe(false);
+    }
+  });
 
-    // Pinned legacy memory survives and is searchable (CJK too).
-    expect(await runCli(["--db", db(), "list", "--pinned"])).toBe(0);
-    expect(stdout()).toContain("legacy preference: use pnpm");
-    expect(await runCli(["--db", db(), "search", "跨会话"])).toBe(0);
-    expect(stdout()).toContain("旧的中文记忆");
+  it("rejects retired migrate without changing existing database or committed WAL bytes", async () => {
+    const writer = new MemoryStore(db());
+    try {
+      const original = writer.write("keep committed memory", [], { pinned: true }).record;
+      const files = [db(), db() + "-wal", db() + "-shm"];
+      const before = files.map((file) => readFileSync(file));
+      expect(await runCli(["--db", db(), "migrate", db(), "--json"])).toBe(1);
+      expect(stdout()).toBe("");
+      expect(errChunks.join("")).toContain("scripts/legacy-migration/README.md");
+      // No connection is opened, so even SHM bytes remain unchanged.
+      for (const [index, file] of files.entries()) {
+        expect(readFileSync(file)).toEqual(before[index]);
+      }
+      expect(writer.list()).toEqual([original]);
+    } finally { writer.close(); }
   });
 
   it("rejects unknown, mutually exclusive, and surplus arguments", async () => {

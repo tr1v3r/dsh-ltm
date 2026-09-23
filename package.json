@@ -1,6 +1,6 @@
 {
   "name": "@tr1v3r/dsh-ltm",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Structured long-term memory for DeepSeek Harness: CJK-aware tokenized search, hybrid rerank, dedupe, expiry review, and migration from dsh-memory — zero mandatory network",
   "keywords": [
     "dsh",

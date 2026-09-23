@@ -96,8 +96,10 @@ grep -n 'dsh-memory' /tmp/dump-tui.yaml /tmp/dump-web.yaml             # 期望�
 # 1) 备份
 cp ~/.config/dsh/memory/memory.db ~/.config/dsh/memory/memory.db.bak-$(date +%Y%m%d)
 cp ~/.config/dsh/memory/memory.db-wal ~/.config/dsh/memory/memory.db-wal.bak-$(date +%Y%m%d) 2>/dev/null || true
-# 2) 迁移（CLI 只读打开旧库副本，原库不动）
-dsh-ltm migrate ~/.config/dsh/memory/memory.db          # 默认目标 $DSH_HOME/memory/ltm.db
+# 2) 迁移（一次性仓库脚本，只读打开旧库副本，原库不动；详见 scripts/legacy-migration/README.md）
+git clone https://github.com/tr1v3r/dsh-ltm /tmp/dsh-ltm && cd /tmp/dsh-ltm && pnpm install
+pnpm exec tsx scripts/legacy-migration/cli.ts \
+  --source ~/.config/dsh/memory/memory.db --db ~/.config/dsh/memory/ltm.db
 # 3) 验收
 dsh-ltm list --limit 20
 dsh-ltm list --pinned                                    # pinned 记录迁移后可见
