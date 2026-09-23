@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -147,6 +147,106 @@ describe("cli", () => {
     const unchanged = new MemoryStore(imported);
     expect(unchanged.list()[0]).toEqual(original);
     unchanged.close();
+  });
+
+  it("rejects exports over the database and its file aliases without changing bytes", async () => {
+    const writer = new MemoryStore(db());
+    const original = writer.write("keep this memory", [], { pinned: true }).record;
+    writer.close();
+    const before = readFileSync(db());
+    const symlink = join(dir, "db-symlink.json");
+    const hardlink = join(dir, "db-hardlink.json");
+    symlinkSync(db(), symlink);
+    linkSync(db(), hardlink);
+    for (const output of [db(), symlink, hardlink]) {
+      resetOut();
+      expect(await runCli(["--db", db(), "export", "--out", output])).toBe(1);
+      expect(stdout()).toBe("");
+      expect(errChunks.join("")).toMatch(/database|already exists/);
+      expect(readFileSync(db())).toEqual(before);
+    }
+    const reopened = new MemoryStore(db());
+    try { expect(reopened.list()).toEqual([original]); }
+    finally { reopened.close(); }
+  });
+
+  it("preserves live WAL and SHM files when export targets them or their aliases", async () => {
+    const writer = new MemoryStore(db());
+    try {
+      writer.write("committed WAL memory", []);
+      const files = [db(), db() + "-wal", db() + "-shm"];
+      for (const file of files.slice(1)) {
+        const alias = file + ".json";
+        symlinkSync(file, alias);
+        for (const output of [file, alias]) {
+          const before = files.map((path) => readFileSync(path));
+          expect(await runCli(["--db", db(), "export", "--out", output])).toBe(1);
+          // SQLite read locks may update SHM; committed main/WAL bytes must not change.
+          expect(readFileSync(files[0]!)).toEqual(before[0]);
+          expect(readFileSync(files[1]!)).toEqual(before[1]);
+          expect(readFileSync(file).subarray(0, 1).toString()).not.toBe("{");
+        }
+      }
+      expect(writer.search("committed")).toHaveLength(1);
+    } finally { writer.close(); }
+  });
+
+  it("reserves absent SQLite sidecars through directory and database symlinks", async () => {
+    const writer = new MemoryStore(db());
+    writer.close();
+    const directoryAlias = join(dir, "alias");
+    symlinkSync(dir, directoryAlias, "dir");
+    const databaseAlias = join(dir, "database-alias.db");
+    symlinkSync(db(), databaseAlias);
+    for (const suffix of ["-wal", "-shm", "-journal"]) {
+      // An idle SQLite connection may create WAL/SHM while export runs, but the
+      // nonexistent journal path and both canonical/alias sidecar names are reserved.
+      for (const output of [db() + suffix, join(directoryAlias, "ltm.db" + suffix), databaseAlias + suffix]) {
+        expect(await runCli(["--db", databaseAlias, "export", "--out", output])).toBe(1);
+        expect(errChunks.join("")).toContain("SQLite sidecars");
+        expect(existsSync(output)).toBe(false);
+      }
+    }
+  });
+
+  it("reserves absent sidecars reached through symlink/.. or case variants", async () => {
+    const writer = new MemoryStore(db());
+    writer.close();
+    mkdirSync(join(dir, "child"));
+    mkdirSync(join(dir, "safe"));
+    symlinkSync(join(dir, "child"), join(dir, "safe", "link"), "dir");
+    // Do not use path.join here: it would collapse the symlink/.. pair.
+    const viaParent = `${dir}/safe/link/../ltm.db-journal`;
+    for (const output of [viaParent, join(dir, "LTM.DB-JOURNAL")]) {
+      resetOut();
+      expect(await runCli(["--db", db(), "export", "--out", output])).toBe(1);
+      expect(errChunks.join("")).toContain("SQLite sidecars");
+      expect(existsSync(output)).toBe(false);
+      expect(existsSync(db() + "-journal")).toBe(false);
+    }
+  });
+
+  it("reserves Unicode-normalization aliases of absent sidecar names", async () => {
+    const database = join(dir, "caf\u00e9.db");
+    const output = join(dir, "cafe\u0301.db-journal");
+    const writer = new MemoryStore(database);
+    writer.close();
+    expect(await runCli(["--db", database, "export", "--out", output])).toBe(1);
+    expect(errChunks.join("")).toContain("SQLite sidecars");
+    expect(existsSync(output)).toBe(false);
+    expect(existsSync(database + "-journal")).toBe(false);
+  });
+
+  it("does not overwrite existing exports or follow dangling output symlinks", async () => {
+    const output = join(dir, "existing.json");
+    writeFileSync(output, "previous backup");
+    expect(await runCli(["--db", db(), "export", "--out", output])).toBe(1);
+    expect(readFileSync(output, "utf8")).toBe("previous backup");
+    const target = join(dir, "must-not-create.json");
+    const alias = join(dir, "dangling.json");
+    symlinkSync(target, alias);
+    expect(await runCli(["--db", db(), "export", "--out", alias])).toBe(1);
+    expect(existsSync(target)).toBe(false);
   });
 
   it("rejects malformed and unsupported import payloads", async () => {

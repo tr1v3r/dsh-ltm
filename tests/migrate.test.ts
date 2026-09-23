@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -53,6 +53,12 @@ function buildLegacyDb(dir: string): string {
 
 function sha256(path: string): string {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+// SHM is coordination state; read-only SQLite may update it. Main DB and
+// committed WAL bytes must remain identical, including on source refusal.
+function databaseHashes(path: string): (string | null)[] {
+  return [path, path + "-wal"].map(file => existsSync(file) ? sha256(file) : null);
 }
 
 describe("migrateLegacy (R8)", () => {
@@ -126,17 +132,86 @@ describe("migrateLegacy (R8)", () => {
     ]);
   });
 
-  it("preserves SQLite errors instead of treating I/O failures as missing sidecars", () => {
+  it.each(["same target", "target symlink", "different modern source"])(
+    "rejects %s without changing either database or globalizing project rows",
+    kind => {
+      const dir = mkdtempSync(join(tmpdir(), "dsh-ltm-modern-source-"));
+      dirs.push(dir);
+      const target = join(dir, "ltm.db");
+      const store = new MemoryStore(target);
+      stores.push(store);
+      store.write("private project preference", ["private"], { scope: "/project" });
+      let source = target;
+      if (kind === "target symlink") {
+        source = join(dir, "alias.db");
+        symlinkSync(target, source);
+      } else if (kind === "different modern source") {
+        source = join(dir, "modern.db");
+        const other = new MemoryStore(source);
+        stores.push(other);
+        other.write("another project's secret", [], { scope: "/other" });
+      }
+      const before = store.list();
+      const targetBytes = databaseHashes(target);
+      const sourceBytes = databaseHashes(source);
+      expect(() => migrateLegacy(source, store)).toThrow(/unsupported legacy source schema/);
+      expect(store.list()).toEqual(before);
+      expect(store.list({ scope: "" })).toEqual([]);
+      expect(databaseHashes(target)).toEqual(targetBytes);
+      expect(databaseHashes(source)).toEqual(sourceBytes);
+    },
+  );
+
+  it.each([
+    ["missing column", "ALTER TABLE memories DROP COLUMN updated_at"],
+    ["extra scope column", "ALTER TABLE memories ADD COLUMN scope TEXT NOT NULL DEFAULT ''"],
+    ["wrong column type", `
+      DROP TRIGGER memories_ai;
+      ALTER TABLE memories RENAME TO old_memories;
+      CREATE TABLE memories (id INTEGER PRIMARY KEY, text TEXT, tags TEXT, pinned INTEGER, created_at TEXT, updated_at INTEGER);
+    `],
+    ["view instead of table", `
+      ALTER TABLE memories RENAME TO old_memories;
+      CREATE VIEW memories AS SELECT * FROM old_memories;
+    `],
+    ["unversioned", "PRAGMA user_version = 0"],
+    ["future version", "PRAGMA user_version = 2"],
+    ["invalid version", "PRAGMA user_version = -1"],
+  ])("rejects %s legacy sources read-only before importing any rows", (_label, sql) => {
+    const dir = mkdtempSync(join(tmpdir(), "dsh-ltm-unsupported-source-"));
+    dirs.push(dir);
+    const source = buildLegacyDb(dir);
+    const writer = new DatabaseSync(source);
+    try {
+      writer.exec(sql);
+      const target = join(dir, "ltm.db");
+      const store = new MemoryStore(target);
+      stores.push(store);
+      store.write("existing destination memory", [], { scope: "/project" });
+      const before = store.list();
+      const sourceBytes = databaseHashes(source);
+      const targetBytes = databaseHashes(target);
+      expect(() => migrateLegacy(source, store)).toThrow(/unsupported legacy source (schema|version)/);
+      expect(store.list()).toEqual(before);
+      expect(databaseHashes(source)).toEqual(sourceBytes);
+      expect(databaseHashes(target)).toEqual(targetBytes);
+    } finally {
+      writer.close();
+    }
+  });
+
+  it("rejects an unrelated empty database before importing", () => {
     const dir = mkdtempSync(join(tmpdir(), "dsh-ltm-legacy-bad-"));
     dirs.push(dir);
     const source = join(dir, "memory.db");
     const db = new DatabaseSync(source);
     db.close();
-    // An empty SQLite file has no legacy table. Its real diagnostic must reach
-    // the caller; there is no sidecar-copy catch that can hide it.
     const store = new MemoryStore(":memory:");
     stores.push(store);
-    expect(() => migrateLegacy(source, store)).toThrow(/no such table: memories/);
+    const before = sha256(source);
+    expect(() => migrateLegacy(source, store)).toThrow(/unsupported legacy source schema/);
+    expect(store.count()).toBe(0);
+    expect(sha256(source)).toBe(before);
   });
 
   it("serializes a consistent snapshot of a live WAL database", () => {

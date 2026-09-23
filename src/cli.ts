@@ -9,9 +9,9 @@
  * @module dsh-ltm/cli
  */
 
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { loadConfig } from "./config.js";
 import { MemoryStore } from "./store.js";
 import { migrateLegacy } from "./migrate.js";
@@ -48,7 +48,7 @@ commands:
   pin <id> [--off]
   merge <targetId> <sourceId>... [--text <text>] [--tags a,b]
   confirm <id>|--all
-  export [--out <file>]          (JSON to stdout or file)
+  export [--out <file>]          (JSON to stdout or a new file; never overwrites)
   import <file>                  (JSON produced by export)
   migrate <legacyDbPath>         (legacy dsh-memory db, read-only)
   help
@@ -252,6 +252,36 @@ function out(json: boolean, data: unknown, human: string): void {
     process.stdout.write(JSON.stringify(data, null, 2) + "\n");
   } else if (human.trim().length > 0) {
     process.stdout.write(human + "\n");
+  }
+}
+
+/** Never truncate an existing file (including hardlinks/symlinks to SQLite).
+ * Reserve absent SQLite sidecars too: creating JSON at a future WAL/journal path
+ * would break the next database writer. Canonicalize parent-directory aliases.
+ */
+function writeExportFile(file: string, payload: string, dbPath: string): void {
+  // Resolve the raw parent through the filesystem before normalizing: lexical
+  // resolve() would collapse a symlink/.. pair to the wrong directory.
+  const output = join(realpathSync.native(dirname(file)), basename(file));
+  const databasePaths = [resolve(dbPath), realpathSync.native(dbPath)];
+  const filenameKey = (path: string) => path.normalize("NFC").toLowerCase();
+  for (const database of databasePaths) {
+    const canonical = join(realpathSync(dirname(database)), basename(database));
+    // Reserve case/Unicode-normalization variants conservatively even on
+    // case-sensitive hosts, covering absent filename aliases on macOS too.
+    if (["", "-wal", "-shm", "-journal"].some((suffix) => filenameKey(output) === filenameKey(canonical + suffix))) {
+      fail("export: --out must not target the database or its SQLite sidecars");
+    }
+  }
+  try {
+    // Exclusive creation also closes the check-then-truncate race and rejects
+    // dangling symlinks without following them.
+    writeFileSync(output, payload, { encoding: "utf8", flag: "wx" });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      fail("export: --out already exists; choose a new file (existing files are never overwritten)");
+    }
+    throw error;
   }
 }
 
@@ -464,7 +494,7 @@ export async function runCli(argv: readonly string[]): Promise<number> {
           if (outFile === undefined) {
             process.stdout.write(payload + "\n");
           } else {
-            writeFileSync(outFile, payload, "utf8");
+            writeExportFile(outFile, payload, config.path);
             out(
               json,
               { exported: records.length, file: outFile },

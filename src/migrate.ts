@@ -32,6 +32,40 @@ interface LegacyRow {
 }
 
 /**
+ * Only the version-1 legacy row layout is supported (verified against the
+ * published dsh-memory@0.1.0 schema and its PRAGMA user_version). Accepting
+ * a superset would silently turn modern LTM project memories into global ones
+ * (including when the caller supplies the destination itself as the source).
+ * The derived legacy FTS index/triggers are not needed to import base rows.
+ */
+function assertLegacySource(db: DatabaseSync): void {
+  const table = db.prepare("SELECT type FROM sqlite_schema WHERE name = 'memories'").get();
+  const columns = db.prepare("PRAGMA table_xinfo(memories)").all();
+  const expected = [
+    ["id", "INTEGER", 1],
+    ["text", "TEXT", 0],
+    ["tags", "TEXT", 0],
+    ["pinned", "INTEGER", 0],
+    ["created_at", "INTEGER", 0],
+    ["updated_at", "INTEGER", 0],
+  ] as const;
+  if (table?.type !== "table" || columns.length !== expected.length ||
+      expected.some(([name, type, pk]) => !columns.some(column =>
+        column.name === name && column.type === type && column.pk === pk &&
+        column.notnull === (name === "id" ? 0 : 1) && column.hidden === 0))) {
+    throw new Error(
+      "dsh-ltm: unsupported legacy source schema; expected the dsh-memory v1 memories table, not an LTM or unrelated database.",
+    );
+  }
+  const version = db.prepare("PRAGMA user_version").get()?.user_version;
+  if (version !== 1) {
+    throw new Error(
+      `dsh-ltm: unsupported legacy source version ${String(version)}; expected dsh-memory PRAGMA user_version = 1.`,
+    );
+  }
+}
+
+/**
  * Migrate every row of the legacy dsh-memory database into `store`.
  *
  * Mapping: `scope = ""`, `last_confirmed_at = updated_at`, tags re-normalized
@@ -57,6 +91,7 @@ export function migrateLegacy(sourcePath: string, store: MemoryStore): Migration
     const tempDb = join(tempDir, "legacy.db");
     const source = new DatabaseSync(sourcePath, { readOnly: true });
     try {
+      assertLegacySource(source);
       // VACUUM INTO reads the source through one SQLite transaction, so
       // committed WAL frames are captured atomically instead of racing
       // independent filesystem copies. It is used instead of
@@ -69,6 +104,9 @@ export function migrateLegacy(sourcePath: string, store: MemoryStore): Migration
 
     const snapshot = new DatabaseSync(tempDb, { readOnly: true });
     try {
+      // A live source may change between preflight and VACUUM. Validate the
+      // actual immutable snapshot as well, before any destination writes.
+      assertLegacySource(snapshot);
       const rows = snapshot.prepare("SELECT * FROM memories ORDER BY id").all() as unknown as LegacyRow[];
       sourceCount = rows.length;
       for (const row of rows) {
