@@ -225,9 +225,9 @@ describe("tool set (surface over real engine)", () => {
     expect(tools.memory_forget({ id: other.id }).deleted).toBe(false);
     now = 2_000;
     expect(tools.memory_confirm({ id: "*" }).confirmed).toBe(2);
-    expect(() =>
-      tools.memory_merge({ targetId: global.id, sourceIds: [local.id] }),
-    ).toThrow(/different scopes/);
+    const crossScope = tools.memory_merge({ targetId: global.id, sourceIds: [local.id] });
+    expect(crossScope.record).toBeUndefined();
+    expect(crossScope.error).toMatchObject({ code: "MEMORY_SCOPE_MISMATCH", operation: "memory_merge" });
     const records = store.list();
     expect(records.find((record) => record.id === other.id)).toMatchObject({
       text: "other project build convention",

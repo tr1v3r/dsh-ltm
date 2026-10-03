@@ -1,15 +1,15 @@
-# dsh-ltm 数据模型（P0 定稿）
+# dsh-ltm 数据模型（P0 定稿；v2 增补见 §1.1）
 
 > 与 `src/contracts.ts` 同步冻结。新库独立路径 `$DSH_HOME/memory/ltm.db`。
 
-## 1. Schema（SCHEMA_VERSION = 1）
+## 1. Schema（SCHEMA_VERSION = 2）
 
 ```sql
 CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
--- meta.schema_version = '1'
+-- meta.schema_version = '2'
 
 CREATE TABLE IF NOT EXISTS memories (
   id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -19,7 +19,9 @@ CREATE TABLE IF NOT EXISTS memories (
   pinned           INTEGER NOT NULL DEFAULT 0,
   created_at       INTEGER NOT NULL,             -- epoch ms
   updated_at       INTEGER NOT NULL,
-  last_confirmed_at INTEGER NOT NULL
+  last_confirmed_at INTEGER NOT NULL,
+  revision         INTEGER NOT NULL DEFAULT 1    -- CAS 版本，见 §1.1
+    CHECK (typeof(revision) = 'integer' AND revision BETWEEN 1 AND 9007199254740991)
 );
 
 -- CJK 单字 + 二元分词索引（content 自持有；不用 external-content，
@@ -49,8 +51,67 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
   写入逐字 unigram 和相邻 bigram：单字查询可命中长文本，bigram 保留多字短语的
   选择性。检索 = 查询同构分词 → 去重、全引号拼 `OR` MATCH → BM25 候选。
 - WAL + `busy_timeout=5000`；所有写操作单事务包裹（含 FTS 同步）。去重检查在 `BEGIN IMMEDIATE` 后执行，跨连接并发写不会绕过检查。
-- 导出格式 `dsh-ltm-export/1` 保留全部字段；导入严格验证并原样恢复 id/时间戳/tags/scope/pinned。相同 ID 且内容完全一致时幂等跳过，不同则整批事务回滚。
+- 导出格式 `dsh-ltm-export/2`（每条 revision 必填）；导入同时接受 `/1`（缺版本按 1 恢复、带版本严格校验）与 `/2`，严格验证并原样恢复 id/时间戳/tags/scope/pinned/revision。相同 ID 且含 revision 的全部状态一致时幂等跳过，不同则整批事务回滚（见 §1.1）。
 - `stale` 不是列：`last_confirmed_at + staleAfterDays*86400000 < now` 派生。
+
+### 1.1 revision 与乐观并发（issue #32 阶段一，schema v1→v2）
+
+`memories.revision` 是与时钟完全无关的正安全整数（1..9007199254740991，
+即 `Number.MAX_SAFE_INTEGER`），NOT NULL DEFAULT 1 并带 CHECK 约束。写路径规则：
+
+- 新 write/force 写入 =1；dedupe 命中不修改旧记录、返回其当前版本。
+- update 成功一次 +1（text/tags/pinned 任意更新、同值 patch、空 patch 均算）；
+  不隐式刷新 `last_confirmed_at`。
+- confirm 单条成功 +1，仅刷新 `last_confirmed_at`，保持 updatedAt/正文；同毫秒
+  确认也 +1。`confirm('*')` 每条实际匹配（可见 scope 内）记录 +1，整批同一事务，
+  任一可见行到达上限即 `MEMORY_REVISION_OVERFLOW` 全批失败。
+- merge 目标 +1（即使正文相同），源记录物理删除且不产生可见新版本；目标保持旧
+  `last_confirmed_at`。上限源可被匹配版本删除；上限目标禁止 merge。
+- forget 真正删除基表+FTS 行，无历史/tombstone，不为已删除行递增。
+- 导出格式 `dsh-ltm-export/2` 每条 revision 必填；`/1` 缺版本按 1 导入、带版本
+  严格校验。importRecords 对现有 ID 做含 revision 的全字段幂等比较，不同即整批
+  回滚，绝不覆盖写（也不导入降版本）。
+- schema v1→v2 显式升级把旧行初始化为 1，不改正文/timestamps/scope/tags/pinned；
+  FTS 重建与 `fts_token_version` 修复不递增 revision；搜索/list/forPrompt/doctor/
+  export 均不递增。
+- 读取路径（toRecord）拒绝缺失/畸形 revision 的行，绝不静默按 1 读取。
+
+CAS 输入严格校验：`expectedRevision`/merge 参与者版本只接受正安全整数；
+0、负数、小数、NaN、Infinity、null、字符串一律 `MEMORY_INVALID_ARGUMENT`，
+不得按「未提供」降级。未提供任何版本字段 = 明确的非 CAS 旧行为（不宣称受保护）。
+提供版本时，读取-比较-写入（基表+revision+FTS）在同一个 `BEGIN IMMEDIATE`
+事务内完成；冲突不自动重试旧内容。scope 权限在版本比较之前应用：未知/已删除/
+越权统一 `MEMORY_NOT_FOUND` 且不披露 currentRevision；可见但跨 scope 的 merge
+为 `MEMORY_SCOPE_MISMATCH`；SQLITE_BUSY 保持既有 actionable busy 行为。
+
+工具/CLI 面：`memory_update/confirm/forget` 增 optional `expectedRevision`，
+`memory_merge` 增 `expectedRevision` + `expectedSourceRevisions[]`（恰好覆盖去重
+后源集合）；输出 schema 的记录投影增必填 `revision`；结构化失败为原布尔/计数字段
++ `error:{code,operation,id?,expectedRevision?,currentRevision?}`；
+`confirm('*')` 不接受任何版本字段。prompt 行渲染 `(#id, rev N, …)`。
+CLI `edit/tag/pin/confirm/forget/merge` 增 `--expected-revision`，merge 另有
+`--expected-source-revisions id:rev,id:rev`；CAS 标志在打开库前完成语法与完整性
+校验；`confirm --all --expected-revision` 拒绝。
+
+### 1.2 v1→v2 显式升级路径
+
+普通 `MemoryStore`/插件/CLI 打开 v1 库一律只读拒绝并指向 `dsh-ltm upgrade-schema`
+（`src/upgrade.ts` 的 `upgradeSchema(path, {backupPath?})`）。升级流程：
+
+1. 只读句柄分类：empty（拒绝，不代建库）/ current-v2（metadata-only no-op）/
+   supported-v1（不仅看 meta 值：校验规范 `schema_version='1'`、meta 形状、
+   完整旧列名/类型/not-null/PK、FTS 形状；已有 revision 列或异常自定义结构拒绝）/
+   unsupported（未知无 meta、畸形版本串、schema 0、较新版本、伪造 v1）。
+   拒绝时不建读写句柄，主库与已提交 WAL 字节不变（`-shm` 只读协调例外照旧）。
+2. 备份：只读连接 `VACUUM INTO`（单一一致快照，含已提交 WAL；Node 22/24 通用，
+   不用仅 24 的 serialize API）。默认名 `<db>.pre-v2-backup-<UTC时间戳>`；
+   显式 `--backup` 必须是新文件，拒绝覆盖既有文件/数据库本体/sidecars/别名。
+3. 读写句柄 `BEGIN IMMEDIATE` 后重新核验版本与 v1 结构（不能只信无锁 preflight）；
+   并发已升级则报告 already-current。`ALTER TABLE memories ADD COLUMN revision …`
+   与 `meta.schema_version='2'` 同一事务提交；失败回滚列与版本戳、保留备份，
+   无半升级状态。不动 `fts_token_version`。
+4. 回滚方法（operator 手册）：先停掉所有写入者，再恢复备份快照；升级后发生的
+   写入会随恢复丢失。旧二进制遇 v2 按「较新版本」fail-closed。
 
 ## 2. 迁移（旧 dsh-memory → 新库）
 

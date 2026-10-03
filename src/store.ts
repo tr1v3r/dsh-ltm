@@ -19,9 +19,18 @@ import type {
   MemoryRecord,
   MemoryStore as MemoryStoreContract,
   MergeInput,
+  MutationOptions,
   SearchResult,
+  VersionedMemoryRecord,
   WriteOptions,
 } from "./contracts.js";
+import {
+  MemoryMutationError,
+  MEMORY_REVISION_MAX,
+  isValidRecordId,
+  isValidRevision,
+  type MemoryOperation,
+} from "./errors.js";
 import { findDuplicates } from "./dedupe.js";
 import { staleCutoff } from "./expire.js";
 import { compileMatch, rerankResults } from "./search.js";
@@ -80,7 +89,16 @@ function actionableSqliteError(error: unknown): unknown {
   return wrapped;
 }
 
-function toRecord(row: Row): MemoryRecord {
+function toRecord(row: Row): VersionedMemoryRecord {
+  const revision = row.revision;
+  // A row missing or corrupting revision is never silently read back as a
+  // default; the schema preflight already refuses such databases, this keeps
+  // the invariant one layer lower too.
+  if (!isValidRevision(revision)) {
+    throw new Error(
+      `dsh-ltm: record #${String(row.id)} has an invalid revision; refusing to read a corrupted row`,
+    );
+  }
   return {
     id: row.id as number,
     text: row.text as string,
@@ -90,7 +108,53 @@ function toRecord(row: Row): MemoryRecord {
     createdAt: row.created_at as number,
     updatedAt: row.updated_at as number,
     lastConfirmedAt: row.last_confirmed_at as number,
+    revision,
   };
+}
+
+/**
+ * Read the CAS precondition from caller options. An absent or explicitly
+ * undefined `expectedRevision` means the legacy, non-CAS path (never claimed
+ * to be version-protected); any other present-but-malformed value is a loud
+ * {@link MemoryMutationError} instead of being downgraded to "not provided".
+ */
+function readExpectedRevision(
+  operation: MemoryOperation,
+  options: MutationOptions | undefined,
+  id?: number,
+): { provided: boolean; revision: number | undefined } {
+  const value = options?.expectedRevision;
+  // Explicit `undefined` counts as absent; every other malformed value
+  // (null, strings, 0, negatives, fractions, NaN, Infinity, out of range)
+  // is rejected loudly instead of being downgraded to "not provided".
+  if (value === undefined) return { provided: false, revision: undefined };
+  if (!isValidRevision(value)) {
+    // The malformed value itself is not copied into the detail: the field is
+    // typed as a number, and the message must stay metadata-only.
+    throw new MemoryMutationError({
+      code: "MEMORY_INVALID_ARGUMENT",
+      operation,
+      id,
+    });
+  }
+  return { provided: true, revision: value };
+}
+
+/** Uniform "missing / deleted / out of scope" for CAS callers: no version leak. */
+function notFound(operation: MemoryOperation, id: number): MemoryMutationError {
+  return new MemoryMutationError({ code: "MEMORY_NOT_FOUND", operation, id });
+}
+
+/** Pre-write upper-bound check for every path that increments a revision. */
+function assertIncrementable(operation: MemoryOperation, record: VersionedMemoryRecord): void {
+  if (record.revision >= MEMORY_REVISION_MAX) {
+    throw new MemoryMutationError({
+      code: "MEMORY_REVISION_OVERFLOW",
+      operation,
+      id: record.id,
+      currentRevision: record.revision,
+    });
+  }
 }
 
 /** Tokenize a value for the FTS columns (text/tags/scope share the shape). */
@@ -215,7 +279,7 @@ export class MemoryStore implements MemoryStoreContract {
     this.#db.prepare("DELETE FROM memories_fts WHERE rowid = ?").run(id);
   }
 
-  #get(id: number): MemoryRecord | undefined {
+  #get(id: number): VersionedMemoryRecord | undefined {
     const row = this.#db.prepare("SELECT * FROM memories WHERE id = ?").get(id) as Row | undefined;
     return row === undefined ? undefined : toRecord(row);
   }
@@ -259,8 +323,8 @@ export class MemoryStore implements MemoryStoreContract {
       }
       const row = this.#db
         .prepare(
-          `INSERT INTO memories (text, tags, scope, pinned, created_at, updated_at, last_confirmed_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+          `INSERT INTO memories (text, tags, scope, pinned, created_at, updated_at, last_confirmed_at, revision)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 1) RETURNING *`,
         )
         .get(
           trimmed,
@@ -283,21 +347,25 @@ export class MemoryStore implements MemoryStoreContract {
    * given. Runs the dedupe check against the target scope and reports hits
    * without writing when not forced (migration uses this to count
    * `dedupedCount`).
+   *
+   * Legacy boundary: inserted rows always start at `revision = 1`, and a
+   * dedupe hit returns the existing record with its current revision without
+   * modifying or incrementing it.
    */
   insertMigrated(
     record: Omit<MemoryRecord, "id">,
     force?: boolean,
-  ): { record: MemoryRecord; dedupeHits: DedupeHit[] } {
+  ): { record: VersionedMemoryRecord; dedupeHits: DedupeHit[] } {
     const text = this.#validateText(record.text, "import");
     return this.#transaction(() => {
       const hits = force === true ? [] : this.#findDuplicates(text, record.scope);
       if (hits.length > 0) {
-        return { record: hits[0]!.record, dedupeHits: hits };
+        return { record: hits[0]!.record as VersionedMemoryRecord, dedupeHits: hits };
       }
       const row = this.#db
         .prepare(
-          `INSERT INTO memories (text, tags, scope, pinned, created_at, updated_at, last_confirmed_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+          `INSERT INTO memories (text, tags, scope, pinned, created_at, updated_at, last_confirmed_at, revision)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 1) RETURNING *`,
         )
         .get(
           text,
@@ -396,11 +464,21 @@ export class MemoryStore implements MemoryStoreContract {
   }
 
   importRecords(records: readonly MemoryRecord[]): { imported: number; skipped: number } {
-    const prepared = records.map((record) => ({
-      ...record,
-      text: this.#validateText(record.text, "import"),
-      tags: normalizeTags(record.tags.split(" ")),
-    }));
+    const prepared = records.map((record) => {
+      // Legacy export files (`dsh-ltm-export/1`) carry no revision and are
+      // restored at 1 — the only boundary where absent means 1. Versioned
+      // backups keep their revision, strictly validated; a malformed value
+      // is never silently repaired or dropped.
+      if (record.revision !== undefined && !isValidRevision(record.revision)) {
+        throw new Error(`memory import: record #${record.id} has an invalid revision`);
+      }
+      return {
+        ...record,
+        revision: record.revision ?? 1,
+        text: this.#validateText(record.text, "import"),
+        tags: normalizeTags(record.tags.split(" ")),
+      };
+    });
     return this.#transaction(() => {
       let imported = 0;
       let skipped = 0;
@@ -409,7 +487,9 @@ export class MemoryStore implements MemoryStoreContract {
         if (existing !== undefined) {
           // Compare fields rather than JSON text: callers may hand us an
           // object whose property order differs, which must still count as the
-          // same record instead of an id conflict.
+          // same record instead of an id conflict. The revision participates
+          // in the full-state comparison, so an id can never be overwritten
+          // (down- or upgraded) by an import.
           if (
             existing.text === record.text &&
             existing.tags === record.tags &&
@@ -417,7 +497,8 @@ export class MemoryStore implements MemoryStoreContract {
             existing.pinned === record.pinned &&
             existing.createdAt === record.createdAt &&
             existing.updatedAt === record.updatedAt &&
-            existing.lastConfirmedAt === record.lastConfirmedAt
+            existing.lastConfirmedAt === record.lastConfirmedAt &&
+            existing.revision === record.revision
           ) {
             skipped++;
             continue;
@@ -427,8 +508,8 @@ export class MemoryStore implements MemoryStoreContract {
         const row = this.#db
           .prepare(
             `INSERT INTO memories
-               (id, text, tags, scope, pinned, created_at, updated_at, last_confirmed_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+               (id, text, tags, scope, pinned, created_at, updated_at, last_confirmed_at, revision)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
           )
           .get(
             record.id,
@@ -439,6 +520,7 @@ export class MemoryStore implements MemoryStoreContract {
             record.createdAt,
             record.updatedAt,
             record.lastConfirmedAt,
+            record.revision,
           ) as Row;
         this.#insertFts(toRecord(row));
         imported++;
@@ -474,15 +556,34 @@ export class MemoryStore implements MemoryStoreContract {
     id: number,
     patch: { text?: string; tags?: readonly string[]; pinned?: boolean },
     scopes?: readonly string[],
-  ): MemoryRecord | undefined {
+    options?: MutationOptions,
+  ): VersionedMemoryRecord | undefined {
     const text = patch.text === undefined ? undefined : this.#validateText(patch.text, "update");
     const allowed = scopes === undefined ? undefined : new Set(scopes);
-    if (allowed?.size === 0) return undefined;
+    // Shape errors are rejected before any lock is taken.
+    const cas = readExpectedRevision("memory_update", options, id);
+    if (allowed?.size === 0) {
+      if (cas.provided) throw notFound("memory_update", id);
+      return undefined;
+    }
     return this.#transaction(() => {
+      // Scopes are applied before any version comparison: unknown, deleted
+      // and out-of-scope ids are indistinguishable for CAS callers.
       const current = this.#get(id);
       if (current === undefined || (allowed !== undefined && !allowed.has(current.scope))) {
+        if (cas.provided) throw notFound("memory_update", id);
         return undefined;
       }
+      if (cas.provided && cas.revision !== current.revision) {
+        throw new MemoryMutationError({
+          code: "MEMORY_REVISION_CONFLICT",
+          operation: "memory_update",
+          id,
+          expectedRevision: cas.revision,
+          currentRevision: current.revision,
+        });
+      }
+      assertIncrementable("memory_update", current);
       const next = {
         text: text ?? current.text,
         tags: patch.tags !== undefined ? normalizeTags(patch.tags) : current.tags,
@@ -490,7 +591,7 @@ export class MemoryStore implements MemoryStoreContract {
       };
       const row = this.#db
         .prepare(
-          `UPDATE memories SET text = ?, tags = ?, pinned = ?, updated_at = ?
+          `UPDATE memories SET text = ?, tags = ?, pinned = ?, updated_at = ?, revision = revision + 1
            WHERE id = ? RETURNING *`,
         )
         .get(next.text, next.tags, next.pinned ? 1 : 0, this.#now(), id) as Row;
@@ -501,60 +602,153 @@ export class MemoryStore implements MemoryStoreContract {
     });
   }
 
-  confirm(id: number | "*", scopes?: readonly string[]): number {
+  confirm(id: number | "*", scopes?: readonly string[], options?: MutationOptions): number {
+    return this.confirmVersioned(id, scopes, options).confirmed;
+  }
+
+  confirmVersioned(
+    id: number | "*",
+    scopes?: readonly string[],
+    options?: MutationOptions,
+  ): { confirmed: number; revision?: number } {
+    // `*` can never carry one revision for the whole batch: rejected before
+    // any read, even when zero records are visible.
+    const cas = readExpectedRevision("memory_confirm", options, id === "*" ? undefined : id);
+    if (id === "*" && cas.provided) {
+      throw new MemoryMutationError({
+        code: "MEMORY_INVALID_ARGUMENT",
+        operation: "memory_confirm",
+      });
+    }
     const uniqueScopes = scopes === undefined ? undefined : [...new Set(scopes)];
-    if (uniqueScopes?.length === 0) return 0;
+    if (uniqueScopes?.length === 0) {
+      if (cas.provided) throw notFound("memory_confirm", id as number);
+      return { confirmed: 0 };
+    }
     const scopeClause =
       uniqueScopes === undefined
         ? ""
         : `scope IN (${uniqueScopes.map(() => "?").join(", ")})`;
     const now = this.#now();
-    try {
+    return this.#transaction(() => {
       if (id === "*") {
-        const where = scopeClause.length === 0 ? "" : ` WHERE ${scopeClause}`;
-        return Number(
+        // Same-transaction precheck + update: one visible row at the ceiling
+        // fails the whole batch before anything is written.
+        const overflow = this.#db
+          .prepare(
+            `SELECT id FROM memories WHERE ${scopeClause.length > 0 ? `${scopeClause} AND ` : ""}revision >= ? ORDER BY id LIMIT 1`,
+          )
+          .get(...(uniqueScopes ?? []), MEMORY_REVISION_MAX) as { id: number } | undefined;
+        if (overflow !== undefined) {
+          throw new MemoryMutationError({
+            code: "MEMORY_REVISION_OVERFLOW",
+            operation: "memory_confirm",
+            id: overflow.id,
+            currentRevision: MEMORY_REVISION_MAX,
+          });
+        }
+        const confirmed = Number(
           this.#db
-            .prepare(`UPDATE memories SET last_confirmed_at = ?${where}`)
+            .prepare(
+              `UPDATE memories SET last_confirmed_at = ?, revision = revision + 1${scopeClause.length === 0 ? "" : ` WHERE ${scopeClause}`}`,
+            )
             .run(now, ...(uniqueScopes ?? [])).changes,
         );
+        return { confirmed };
       }
-      const scopeFilter = scopeClause.length === 0 ? "" : ` AND ${scopeClause}`;
-      return Number(
-        this.#db
-          .prepare(`UPDATE memories SET last_confirmed_at = ? WHERE id = ?${scopeFilter}`)
-          .run(now, id, ...(uniqueScopes ?? [])).changes,
-      );
-    } catch (error) {
-      throw actionableSqliteError(error);
-    }
+      const current = this.#get(id);
+      if (current === undefined || (uniqueScopes !== undefined && !uniqueScopes.includes(current.scope))) {
+        if (cas.provided) throw notFound("memory_confirm", id);
+        return { confirmed: 0 };
+      }
+      if (cas.provided && cas.revision !== current.revision) {
+        throw new MemoryMutationError({
+          code: "MEMORY_REVISION_CONFLICT",
+          operation: "memory_confirm",
+          id,
+          expectedRevision: cas.revision,
+          currentRevision: current.revision,
+        });
+      }
+      assertIncrementable("memory_confirm", current);
+      const row = this.#db
+        .prepare(
+          `UPDATE memories SET last_confirmed_at = ?, revision = revision + 1 WHERE id = ? RETURNING revision`,
+        )
+        .get(now, id) as Row;
+      return { confirmed: 1, revision: row.revision as number };
+    });
   }
 
-  merge(input: MergeInput, scopes?: readonly string[]): MemoryRecord | undefined {
+  merge(input: MergeInput, scopes?: readonly string[]): VersionedMemoryRecord | undefined {
     const replacementText = input.text === undefined
       ? undefined
       : this.#validateText(input.text, "merge");
     const allowed = scopes === undefined ? undefined : new Set(scopes);
-    if (allowed?.size === 0) return undefined;
+    // Legacy `sourceIds` quirks are normalized once: duplicates collapse and
+    // the target id itself is ignored rather than rejected.
+    const sourceIds = [...new Set(input.sourceIds)].filter((id) => id !== input.targetId);
+    const cas = this.#mergePreconditions(input, sourceIds);
+    if (allowed?.size === 0) {
+      if (cas !== undefined) throw notFound("memory_merge", input.targetId);
+      return undefined;
+    }
     return this.#transaction(() => {
       const target = this.#get(input.targetId);
       if (target === undefined || (allowed !== undefined && !allowed.has(target.scope))) {
+        if (cas !== undefined) throw notFound("memory_merge", input.targetId);
         return undefined;
       }
-      const sources: MemoryRecord[] = [];
-      for (const sourceId of input.sourceIds) {
+      const sources: VersionedMemoryRecord[] = [];
+      // Stable order (ascending id) so a multi-party failure reports the
+      // first deterministic conflict.
+      for (const sourceId of [...sourceIds].sort((a, b) => a - b)) {
         const source = this.#get(sourceId);
         if (source === undefined) {
+          if (cas !== undefined) throw notFound("memory_merge", sourceId);
           throw new Error(`memory merge: source #${sourceId} does not exist`);
         }
         if (allowed !== undefined && !allowed.has(source.scope)) {
+          if (cas !== undefined) throw notFound("memory_merge", sourceId);
           throw new Error(`memory merge: source #${sourceId} is outside the active project`);
         }
         if (source.scope !== target.scope) {
-          throw new Error("memory merge: cannot merge memories from different scopes");
+          // Metadata-only failure: no paths, no other scope's content.
+          throw new MemoryMutationError({
+            code: "MEMORY_SCOPE_MISMATCH",
+            operation: "memory_merge",
+            id: sourceId,
+          });
         }
-        if (sourceId === input.targetId) continue;
         sources.push(source);
       }
+      if (cas !== undefined) {
+        // All participants visible and same-scope before any comparison.
+        if (target.revision !== cas.expectedRevision) {
+          throw new MemoryMutationError({
+            code: "MEMORY_REVISION_CONFLICT",
+            operation: "memory_merge",
+            id: target.id,
+            expectedRevision: cas.expectedRevision,
+            currentRevision: target.revision,
+          });
+        }
+        for (const source of sources) {
+          const expected = cas.sourceRevisions.get(source.id);
+          if (expected !== source.revision) {
+            throw new MemoryMutationError({
+              code: "MEMORY_REVISION_CONFLICT",
+              operation: "memory_merge",
+              id: source.id,
+              expectedRevision: expected,
+              currentRevision: source.revision,
+            });
+          }
+        }
+      }
+      // Sources are only deleted, never incremented, so a ceiling source is
+      // mergeable; the target is the one that must still be incrementable.
+      assertIncrementable("memory_merge", target);
       const tagUnion = new Set(
         `${target.tags} ${sources.map((s) => s.tags).join(" ")}`.split(/\s+/).filter(Boolean),
       );
@@ -563,7 +757,7 @@ export class MemoryStore implements MemoryStoreContract {
         input.tags !== undefined ? normalizeTags(input.tags) : [...tagUnion].sort().join(" ");
       const row = this.#db
         .prepare(
-          `UPDATE memories SET text = ?, tags = ?, pinned = ?, updated_at = ?
+          `UPDATE memories SET text = ?, tags = ?, pinned = ?, updated_at = ?, revision = revision + 1
            WHERE id = ? RETURNING *`,
         )
         .get(
@@ -584,21 +778,76 @@ export class MemoryStore implements MemoryStoreContract {
     });
   }
 
-  forget(id: number, scopes?: readonly string[]): boolean {
+  /**
+   * Validate the CAS preconditions of a merge. Absent CAS fields = legacy
+   * (`undefined`); any present field switches to strict mode, which requires
+   * `expectedRevision` for the target plus a complete, exact, duplicate-free
+   * declaration covering every unique non-target source id. All shape errors
+   * throw before any lock or read.
+   */
+  #mergePreconditions(
+    input: MergeInput,
+    sourceIds: readonly number[],
+  ): { expectedRevision: number; sourceRevisions: Map<number, number> } | undefined {
+    const hasTarget = input.expectedRevision !== undefined;
+    const declared = input.expectedSourceRevisions;
+    if (!hasTarget && declared === undefined) return undefined;
+    const invalid = new MemoryMutationError({
+      code: "MEMORY_INVALID_ARGUMENT",
+      operation: "memory_merge",
+      id: input.targetId,
+    });
+    if (!isValidRevision(input.expectedRevision)) throw invalid;
+    if (!Array.isArray(declared)) throw invalid;
+    const sourceSet = new Set(sourceIds);
+    const sourceRevisions = new Map<number, number>();
+    for (const entry of declared) {
+      if (typeof entry !== "object" || entry === null) throw invalid;
+      if (!isValidRecordId(entry.id) || !isValidRevision(entry.revision)) throw invalid;
+      if (entry.id === input.targetId) throw invalid; // target declared as a source
+      if (!sourceSet.has(entry.id)) throw invalid; // extra/unknown id
+      if (sourceRevisions.has(entry.id)) throw invalid; // repeated declaration
+      sourceRevisions.set(entry.id, entry.revision);
+    }
+    if (sourceRevisions.size !== sourceSet.size) throw invalid; // missing sources
+    return { expectedRevision: input.expectedRevision, sourceRevisions };
+  }
+
+  forget(id: number, scopes?: readonly string[], options?: MutationOptions): boolean {
+    return this.forgetVersioned(id, scopes, options).deleted;
+  }
+
+  forgetVersioned(
+    id: number,
+    scopes?: readonly string[],
+    options?: MutationOptions,
+  ): { deleted: boolean; deletedRevision?: number } {
+    const cas = readExpectedRevision("memory_forget", options, id);
     const uniqueScopes = scopes === undefined ? undefined : [...new Set(scopes)];
-    if (uniqueScopes?.length === 0) return false;
-    const scopeFilter =
-      uniqueScopes === undefined
-        ? ""
-        : ` AND scope IN (${uniqueScopes.map(() => "?").join(", ")})`;
+    if (uniqueScopes?.length === 0) {
+      if (cas.provided) throw notFound("memory_forget", id);
+      return { deleted: false };
+    }
     return this.#transaction(() => {
-      const deleted = Number(
-        this.#db
-          .prepare(`DELETE FROM memories WHERE id = ?${scopeFilter}`)
-          .run(id, ...(uniqueScopes ?? [])).changes,
-      ) > 0;
-      if (deleted) this.#deleteFts(id);
-      return deleted;
+      const current = this.#get(id);
+      if (current === undefined || (uniqueScopes !== undefined && !uniqueScopes.includes(current.scope))) {
+        if (cas.provided) throw notFound("memory_forget", id);
+        return { deleted: false };
+      }
+      if (cas.provided && cas.revision !== current.revision) {
+        throw new MemoryMutationError({
+          code: "MEMORY_REVISION_CONFLICT",
+          operation: "memory_forget",
+          id,
+          expectedRevision: cas.revision,
+          currentRevision: current.revision,
+        });
+      }
+      // Deleting needs no increment, so a ceiling revision is forgettable.
+      this.#db.prepare("DELETE FROM memories WHERE id = ?").run(id);
+      this.#deleteFts(id);
+      // The revision that was removed — never a post-delete value.
+      return { deleted: true, deletedRevision: current.revision };
     });
   }
 

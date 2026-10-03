@@ -90,8 +90,9 @@ describe("cli", () => {
   it("export/import preserves complete record state and id conflict semantics", async () => {
     const newDb = join(dir, "roundtrip.db");
     const source = new MemoryStore(newDb, { now: () => 1_000 });
-    const original = source.write("round trip", ["Mixed", "tag"], { scope: "work", pinned: true }).record;
-    source.confirm(original.id);
+    source.write("round trip", ["Mixed", "tag"], { scope: "work", pinned: true });
+    source.confirm(1); // confirm bumps the revision; capture the post-write state
+    const original = source.list()[0];
     source.close();
     const outFile = join(dir, "export.json");
     expect(await runCli(["--db", newDb, "export", "--out", outFile])).toBe(0);

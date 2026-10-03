@@ -14,12 +14,26 @@ import {
   createToolSet,
   budgetFeedbackOutputProperties,
   renderBudgetFeedback,
+  renderToolError,
   memoryRecordOutputSchema,
   memorySearchResultOutputSchema,
   memoryWriteOutputSchema,
+  memoryForgetOutputSchema,
+  memoryUpdateOutputSchema,
+  memoryConfirmOutputSchema,
+  memoryMergeOutputSchema,
   serializers,
   type WriteToolOutput,
 } from "./tools.js";
+export { MemoryMutationError } from "./errors.js";
+export type {
+  MemoryMutationErrorCode,
+  MemoryMutationErrorDetail,
+  MemoryOperation,
+} from "./errors.js";
+export { upgradeSchema } from "./upgrade.js";
+export type { UpgradeSchemaOptions, UpgradeSchemaReport } from "./upgrade.js";
+export { MEMORY_REVISION_MAX } from "./errors.js";
 import { promptLine, renderPrompt } from "./prompt.js";
 import { loadTokenCounter } from "./token-counter.js";
 export { loadTokenCounter } from "./token-counter.js";
@@ -40,15 +54,15 @@ const WRITE_DESCRIPTION =
 const SEARCH_DESCRIPTION =
   "Search global and current-project memories by keyword (CJK-aware tokenization, hybrid rerank). Pinned and recent memories already appear in your context, so search when you need something older or more specific than what you can already see.";
 const FORGET_DESCRIPTION =
-  "Delete one visible global/current-project memory by id, for a fact that is now wrong or obsolete. Ids come from memory_search or memory_write.";
+  "Delete one visible global/current-project memory by id, for a fact that is now wrong or obsolete. Ids come from memory_search or memory_write. Optional expectedRevision: the `rev` of the record you last read — when provided, the delete only happens if that is still the current revision (stale revision = rejected, nothing deleted). Omitting it keeps the legacy unprotected behavior.";
 const UPDATE_DESCRIPTION =
-  "Revise a visible global/current-project memory's text/tags/pinned in place, keeping its id. Prefer this for changed state over writing another record or delete-and-rewrite. If the id is unknown, search first; a known id can be updated directly without a mandatory search.";
+  "Revise a visible global/current-project memory's text/tags/pinned in place, keeping its id. Prefer this for changed state over writing another record or delete-and-rewrite. If the id is unknown, search first; a known id can be updated directly without a mandatory search. Optional expectedRevision: the `rev` of the record you last read — when provided, the update only happens if that is still the current revision; a mismatch is rejected without retrying your change automatically. Re-read the record and retry with its new revision. Omitting it keeps the legacy unprotected behavior.";
 const CONFIRM_DESCRIPTION =
-  'Confirm one visible memory is still accurate (refreshes its review timestamp, clears the stale flag). Pass id: "*" to confirm all global/current-project memories.';
+  'Confirm one visible memory is still accurate (refreshes its review timestamp, clears the stale flag). Pass id: "*" to confirm all global/current-project memories — that refreshes review timestamps, it is NOT a per-record verification and never accepts expectedRevision. For a single id, optional expectedRevision guards the confirm like memory_update.';
 const LIST_DESCRIPTION =
   "Explicitly browse memories across projects, filtered by scope, tags (AND semantics), staleness, or pinned state.";
 const MERGE_DESCRIPTION =
-  "Merge near-duplicate memories from one visible scope into one surviving record: sources are absorbed into the target and deleted; tags default to the union of all merged records.";
+  "Merge near-duplicate memories from one visible scope into one surviving record: sources are absorbed into the target and deleted; tags default to the union of all merged records. Optional CAS: expectedRevision for the target plus expectedSourceRevisions covering every source ({id, revision}) — when either is provided, both are required and all versions are checked before anything changes. Omitting both keeps the legacy unprotected behavior.";
 
 /**
  * Open the store, register the tools, contribute the section.
@@ -243,28 +257,33 @@ export function apply(ctx: Context, rawConfig: unknown) {
           required: true,
           description: "The memory id to delete.",
         },
+        expectedRevision: {
+          type: "integer",
+          description:
+            "The revision (`rev`) of the record you last read. Optional; when provided the delete is version-protected.",
+        },
       },
       output: {
-        schema: {
-          type: "object",
-          additionalProperties: false,
-          properties: {
-            id: { type: "integer", required: true },
-            deleted: { type: "boolean", required: true },
-          },
-        },
+        schema: memoryForgetOutputSchema,
         render: (_args, value) => [
           {
             type: "text",
-            text: value.deleted
-              ? `Forgot memory #${value.id}.`
-              : `No memory #${value.id} to forget.`,
+            text: value.error
+              ? `Forget failed — ${renderToolError(value.error)}.`
+              : value.deleted
+                ? `Forgot memory #${value.id} (was rev ${String(value.deletedRevision)}).`
+                : `No memory #${value.id} to forget.`,
           },
         ],
       },
       async execute(args, exec) {
-        const { deleted } = toolsFor(exec).memory_forget(args);
-        return { id: args.id, deleted };
+        const { deleted, deletedRevision, error } = toolsFor(exec).memory_forget(args);
+        return {
+          id: args.id,
+          deleted,
+          ...(deletedRevision !== undefined ? { deletedRevision } : {}),
+          ...(error !== undefined ? { error } : {}),
+        };
       },
     }),
   );
@@ -282,29 +301,34 @@ export function apply(ctx: Context, rawConfig: unknown) {
           items: { type: "string" },
         },
         pinned: { type: "boolean", description: "New pinned flag." },
+        expectedRevision: {
+          type: "integer",
+          description:
+            "The revision (`rev`) of the record you last read. Optional; when provided the update is version-protected.",
+        },
       },
       output: {
-        schema: {
-          type: "object",
-          additionalProperties: false,
-          properties: {
-            ...budgetFeedbackOutputProperties,
-            updated: { type: "boolean", required: true },
-            id: { type: "integer", required: true },
-          },
-        },
+        schema: memoryUpdateOutputSchema,
         render: (_args, value) => [
           {
             type: "text",
-            text: value.updated
-              ? `Updated memory #${value.id}.${renderBudgetFeedback(value)}`
-              : `No memory #${value.id} to update.`,
+            text: value.error
+              ? `Update failed — ${renderToolError(value.error)}.`
+              : value.updated
+                ? `Updated memory #${value.id} (now rev ${String(value.revision)}).${renderBudgetFeedback(value)}`
+                : `No memory #${value.id} to update.`,
           },
         ],
       },
       async execute(args, exec) {
-        const { record, ...feedback } = toolsFor(exec).memory_update(args);
-        return { updated: record !== undefined, id: args.id, ...feedback };
+        const { record, error, revision: _revision, ...feedback } = toolsFor(exec).memory_update(args);
+        return {
+          updated: record !== undefined,
+          id: args.id,
+          ...(record !== undefined ? { revision: record.revision } : {}),
+          ...feedback,
+          ...(error !== undefined ? { error } : {}),
+        };
       },
     }),
   );
@@ -319,17 +343,21 @@ export function apply(ctx: Context, rawConfig: unknown) {
           required: true,
           description: 'The memory id, or "*" to confirm all.',
         },
+        expectedRevision: {
+          type: "integer",
+          description:
+            "The revision (`rev`) of the record you last read. Only valid with a single id, never with *.",
+        },
       },
       output: {
-        schema: {
-          type: "object",
-          additionalProperties: false,
-          properties: {
-            confirmed: { type: "integer", required: true },
-          },
-        },
+        schema: memoryConfirmOutputSchema,
         render: (_args, value) => [
-          { type: "text", text: `Confirmed ${value.confirmed} memory(ies).` },
+          {
+            type: "text",
+            text: value.error
+              ? `Confirm failed — ${renderToolError(value.error)}.`
+              : `Confirmed ${value.confirmed} memory(ies)${value.revision === undefined ? "" : ` (now rev ${value.revision})`}.`,
+          },
         ],
       },
       async execute(args, exec) {
@@ -337,7 +365,15 @@ export function apply(ctx: Context, rawConfig: unknown) {
         if (id !== "*" && !Number.isInteger(id)) {
           throw new Error('memory_confirm: `id` must be an integer or "*"');
         }
-        return toolsFor(exec).memory_confirm({ id });
+        const { confirmed, revision, error } = toolsFor(exec).memory_confirm({
+          id,
+          ...(args.expectedRevision !== undefined ? { expectedRevision: args.expectedRevision } : {}),
+        });
+        return {
+          confirmed,
+          ...(revision !== undefined ? { revision } : {}),
+          ...(error !== undefined ? { error } : {}),
+        };
       },
     }),
   );
@@ -419,28 +455,50 @@ export function apply(ctx: Context, rawConfig: unknown) {
           description: "Replacement tags; defaults to the union of all records.",
           items: { type: "string" },
         },
-      },
-      output: {
-        schema: {
-          type: "object",
-          additionalProperties: false,
-          properties: {
-            merged: { type: "boolean", required: true },
-            targetId: { type: "integer", required: true },
+        expectedRevision: {
+          type: "integer",
+          description:
+            "The revision (`rev`) of the target you last read; required once any CAS field is provided.",
+        },
+        expectedSourceRevisions: {
+          type: "array",
+          description:
+            "One {id, revision} entry per source (exactly the unique sources, no extras).",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              id: { type: "integer", required: true, description: "Source memory id." },
+              revision: {
+                type: "integer",
+                required: true,
+                description: "The revision of that source you last read.",
+              },
+            },
           },
         },
+      },
+      output: {
+        schema: memoryMergeOutputSchema,
         render: (_args, value) => [
           {
             type: "text",
-            text: value.merged
-              ? `Merged into memory #${value.targetId}.`
-              : `Merge failed — no memory #${value.targetId}.`,
+            text: value.error
+              ? `Merge failed — ${renderToolError(value.error)}.`
+              : value.merged
+                ? `Merged into memory #${value.targetId} (now rev ${String(value.revision)}).`
+                : `Merge failed — no memory #${value.targetId}.`,
           },
         ],
       },
       async execute(args, exec) {
-        const { record } = toolsFor(exec).memory_merge(args);
-        return { merged: record !== undefined, targetId: args.targetId };
+        const { record, error } = toolsFor(exec).memory_merge(args);
+        return {
+          merged: record !== undefined,
+          targetId: args.targetId,
+          ...(record !== undefined ? { revision: record.revision } : {}),
+          ...(error !== undefined ? { error } : {}),
+        };
       },
     }),
   );

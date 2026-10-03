@@ -8,7 +8,11 @@
 //   2. write -> search -> confirm -> forget full chain executes against the
 //      real on-disk SQLite store opened by the plugin;
 //   3. CJK end-to-end: Chinese write is searchable by Chinese keywords;
-//   4. the recall section appears in the assembled system prompt.
+//   4. the recall section appears in the assembled system prompt;
+//   5. revision CAS end-to-end (issue #32 phase 1): read a revision, succeed
+//      with it, hit a structured conflict through the real registry, exercise
+//      strict merge/confirm/forget and foreign-scope isolation;
+//   6. two agents sharing one plugin/store stay isolated by session cwd.
 //
 // Usage: node probe/boot-probe.mjs [db-path]   (default probe/tmp/ltm.db)
 
@@ -171,6 +175,68 @@ const missingUpdate = await call("memory_update", { id: 999999, pinned: true });
 check("missing update omits budget", !missingUpdate.updated && missingUpdate.budget === undefined);
 check("ordinary write omits budget", w2.budget === undefined);
 check("blocked write omits budget", dup.budget === undefined);
+
+// 6. revision CAS end-to-end through the real registry (issue #32 phase 1).
+const casWrite = await call("memory_write", { text: "CAS probe unique durable fact kqzxv.", force: true });
+const casId = casWrite.record.id;
+check("write returns revision 1", casWrite.record.revision === 1, `rev=${casWrite.record.revision}`);
+const casRead = await call("memory_search", { query: "kqzxv" });
+check("search results carry revision", casRead.results[0]?.revision === 1);
+const casOk = await executeCall("memory_update", { id: casId, tags: ["cas"], expectedRevision: 1 });
+check("registry CAS update passes output schema", casOk.value.updated === true && casOk.value.revision === 2);
+check("registry CAS update renders revision", casOk.content.some((block) => block.type === "text" && block.text.includes("rev 2")));
+const casConflict = await executeCall("memory_update", { id: casId, text: "stale write kqzxv", expectedRevision: 1 });
+check("stale CAS update is a structured conflict, not 'no memory'",
+  casConflict.value.updated === false &&
+  casConflict.value.error?.code === "MEMORY_REVISION_CONFLICT" &&
+  casConflict.value.error?.expectedRevision === 1 &&
+  casConflict.value.error?.currentRevision === 2,
+  JSON.stringify(casConflict.value.error));
+check("conflict render shows the code and re-read guidance", casConflict.content.some((block) =>
+  block.type === "text" && block.text.includes("revision conflict") && block.text.includes("re-read")));
+const afterConflict = await call("memory_search", { query: "kqzxv" });
+check("conflict changed nothing",
+  afterConflict.results[0]?.revision === 2 && afterConflict.results[0]?.text.startsWith("CAS probe unique"));
+
+const casMergeSource = await call("memory_write", { text: "CAS probe merge source fact kqzxv2.", force: true });
+const mergeOk = await executeCall("memory_merge", {
+  targetId: casId,
+  sourceIds: [casMergeSource.record.id],
+  expectedRevision: 2,
+  expectedSourceRevisions: [{ id: casMergeSource.record.id, revision: 1 }],
+});
+check("strict merge through registry succeeds with target revision",
+  mergeOk.value.merged === true && mergeOk.value.revision === 3);
+const mergeConflict = await executeCall("memory_merge", {
+  targetId: casId,
+  sourceIds: [],
+  expectedRevision: 2, // stale on purpose
+  expectedSourceRevisions: [],
+});
+check("stale strict merge is rejected wholesale",
+  mergeConflict.value.merged === false && mergeConflict.value.error?.code === "MEMORY_REVISION_CONFLICT");
+const casConfirm = await executeCall("memory_confirm", { id: String(casId), expectedRevision: 3 });
+check("CAS confirm reports the new revision", casConfirm.value.confirmed === 1 && casConfirm.value.revision === 4);
+const starRejected = await executeCall("memory_confirm", { id: "*", expectedRevision: 4 });
+check("confirm '*' with a revision is rejected",
+  starRejected.value.confirmed === 0 && starRejected.value.error?.code === "MEMORY_INVALID_ARGUMENT");
+const casForget = await executeCall("memory_forget", { id: casId, expectedRevision: 4 });
+check("CAS forget reports the deleted revision",
+  casForget.value.deleted === true && casForget.value.deletedRevision === 4);
+const casGone = await call("memory_search", { query: "kqzxv" });
+check("CAS-forgotten memory is unsearchable", !casGone.results.some((r) => r.id === casId));
+
+// Foreign-scope CAS stays metadata-only through the registry.
+const foreignDenied = await executeCall("memory_update", { id: otherId, text: "leak", expectedRevision: 1 });
+check("foreign CAS update is NOT_FOUND without version disclosure",
+  foreignDenied.value.updated === false &&
+  foreignDenied.value.error?.code === "MEMORY_NOT_FOUND" &&
+  foreignDenied.value.error?.currentRevision === undefined);
+const foreignForget = await executeCall("memory_forget", { id: otherId, expectedRevision: 1 });
+check("foreign CAS forget is NOT_FOUND", foreignForget.value.deleted === false && foreignForget.value.error?.code === "MEMORY_NOT_FOUND");
+const foreignList = await call("memory_list", { scope: otherWrite.record?.scope ?? "" });
+check("cross-project memory_list aggregate still reaches other scopes",
+  foreignList.records.some((record) => record.id === otherId && record.revision === 1));
 
 await ctx.fiber.dispose();
 rmSync(isolatedDir, { recursive: true, force: true });

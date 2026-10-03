@@ -95,9 +95,9 @@ describe("MemoryStore basics", () => {
   });
 
   it("rejects a future schema before PRAGMA or DDL can change its bytes", () => {
-    const path = versionedDb("2");
+    const path = versionedDb("3");
     const before = sha256(path);
-    expect(() => new MemoryStore(path)).toThrow(/newer than supported 1/);
+    expect(() => new MemoryStore(path)).toThrow(/newer than supported 2/);
     expect(sha256(path)).toBe(before);
 
     const db = new DatabaseSync(path, { readOnly: true });
@@ -120,7 +120,16 @@ describe("MemoryStore basics", () => {
   it("fails closed for an unsupported older schema", () => {
     const path = versionedDb("0");
     const before = sha256(path);
-    expect(() => new MemoryStore(path)).toThrow(/older than supported 1.*no migration path/);
+    expect(() => new MemoryStore(path)).toThrow(/older than supported 2.*no migration path/);
+    expect(sha256(path)).toBe(before);
+  });
+
+  it("refuses a v1 database read-only and points at the explicit upgrade path", () => {
+    const path = versionedDb("1");
+    const before = sha256(path);
+    expect(() => new MemoryStore(path)).toThrow(
+      /older than supported 2.*dsh-ltm upgrade-schema.*upgrade explicitly/s,
+    );
     expect(sha256(path)).toBe(before);
   });
 
@@ -128,16 +137,16 @@ describe("MemoryStore basics", () => {
     // The read-write preflight used to open the WAL database read-write, and the
     // close that follows the rejection checkpointed the WAL: main grew and
     // `-wal` disappeared even though the database was refused.
-    const path = uncheckpointedWalDb("2");
+    const path = uncheckpointedWalDb("3");
     const mainBefore = sha256(path);
     const walBefore = sha256(path + "-wal");
-    expect(() => new MemoryStore(path)).toThrow(/newer than supported 1/);
+    expect(() => new MemoryStore(path)).toThrow(/newer than supported 2/);
     expect(sha256(path)).toBe(mainBefore);
     expect(sha256(path + "-wal")).toBe(walBefore);
   });
 
   it("still adopts a valid WAL database through the read-only preflight", () => {
-    const path = uncheckpointedWalDb("1");
+    const path = uncheckpointedWalDb("2");
     const store = new MemoryStore(path);
     stores.push(store);
     expect(store.count()).toBe(0);
@@ -264,10 +273,11 @@ describe("cross-connection invariants", () => {
     const store = open();
     const record = { id: 42, text: "restored", tags: "a b", scope: "work", pinned: true, createdAt: 10, updatedAt: 20, lastConfirmedAt: 15 };
     expect(store.importRecords([record])).toEqual({ imported: 1, skipped: 0 });
-    expect(store.list()[0]).toEqual(record);
+    // A legacy-shape import (no revision) is restored at revision 1.
+    expect(store.list()[0]).toEqual({ ...record, revision: 1 });
     expect(store.importRecords([record])).toEqual({ imported: 0, skipped: 1 });
     expect(() => store.importRecords([{ ...record, text: "conflict" }])).toThrow(/conflicts/);
-    expect(store.list()[0]).toEqual(record);
+    expect(store.list()[0]).toEqual({ ...record, revision: 1 });
   });
 
   it("treats an existing record as identical regardless of property order", () => {

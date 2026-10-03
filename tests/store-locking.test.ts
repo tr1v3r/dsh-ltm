@@ -153,7 +153,7 @@ describe("schema initialization lock boundary", () => {
     },
   );
 
-  it.each(["1", "2"])("rechecks a concurrent initializer's version %s after acquiring the lock", (version) => {
+  it.each(["2", "3"])("rechecks a concurrent initializer's version %s after acquiring the lock", (version) => {
     const path = databasePath();
     const db = raw(path);
     const other = raw(path);
@@ -169,7 +169,7 @@ describe("schema initialization lock boundary", () => {
       }
       return exec.call(this, sql);
     });
-    if (version === "2") {
+    if (version === "3") {
       expect(() => ensureSchema(db)).toThrow(/newer than supported/);
     } else {
       ensureSchema(db);

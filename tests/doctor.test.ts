@@ -98,9 +98,13 @@ describe("read-only doctor", () => {
     expect(doctor(loadConfig({ path: path(), autoProjectScope: false }), "active").prompt.visibleScopes).toEqual(["active"]);
     const broken = join(dir, "broken.db");
     const db = new DatabaseSync(broken);
-    db.exec("CREATE TABLE meta(key TEXT, value TEXT); INSERT INTO meta VALUES('schema_version','1'); CREATE TABLE memories(id INTEGER)");
+    db.exec("CREATE TABLE meta(key TEXT, value TEXT); INSERT INTO meta VALUES('schema_version','2'); CREATE TABLE memories(id INTEGER)");
     db.close();
-    expect(() => doctor(loadConfig({ path: broken }), "")).toThrow(/base-table structure/);
+    // A v2 stamp over a malformed memories table is refused (schema preflight
+    // or the base-table check — either way it never reports health).
+    expect(() => doctor(loadConfig({ path: broken }), "")).toThrow(
+      /incompatible memories base-table structure|incompatible or malformed schema metadata/,
+    );
   });
 
   it("supports configured character and injected token budgets using real rendered candidates", () => {

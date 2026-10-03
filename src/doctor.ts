@@ -12,11 +12,13 @@ function readRecord(row: Record<string, unknown>): MemoryRecord {
   if (!Number.isSafeInteger(row.id) || Number(row.id) < 1 ||
       typeof row.text !== "string" || typeof row.tags !== "string" || typeof row.scope !== "string" ||
       (row.pinned !== 0 && row.pinned !== 1) ||
-      ![row.created_at, row.updated_at, row.last_confirmed_at].every((v) => Number.isSafeInteger(v) && Number(v) >= 0)) {
+      ![row.created_at, row.updated_at, row.last_confirmed_at].every((v) => Number.isSafeInteger(v) && Number(v) >= 0) ||
+      !Number.isSafeInteger(row.revision) || Number(row.revision) < 1 || Number(row.revision) > Number.MAX_SAFE_INTEGER) {
     throw new Error("doctor: malformed memory row; refusing diagnostic snapshot");
   }
   return { id: row.id as number, text: row.text, tags: row.tags, scope: row.scope, pinned: row.pinned === 1,
-    createdAt: row.created_at as number, updatedAt: row.updated_at as number, lastConfirmedAt: row.last_confirmed_at as number };
+    createdAt: row.created_at as number, updatedAt: row.updated_at as number, lastConfirmedAt: row.last_confirmed_at as number,
+    revision: row.revision as number };
 }
 
 export function doctor(config: Config, activeScope: string, tokenCounter?: TokenCounter, maxPairs = 100_000) {
@@ -30,14 +32,14 @@ export function doctor(config: Config, activeScope: string, tokenCounter?: Token
     const table = db.prepare("SELECT type FROM sqlite_schema WHERE name='memories'").get();
     if (table?.type !== "table") throw new Error("doctor: memories must be a base table");
     const columns = db.prepare("PRAGMA table_info(memories)").all();
-    for (const [name, type] of Object.entries({ id: "INTEGER", text: "TEXT", tags: "TEXT", scope: "TEXT", pinned: "INTEGER", created_at: "INTEGER", updated_at: "INTEGER", last_confirmed_at: "INTEGER" })) {
+    for (const [name, type] of Object.entries({ id: "INTEGER", text: "TEXT", tags: "TEXT", scope: "TEXT", pinned: "INTEGER", created_at: "INTEGER", updated_at: "INTEGER", last_confirmed_at: "INTEGER", revision: "INTEGER" })) {
       const column = columns.find((c) => c.name === name);
       if (!column || String(column.type).toUpperCase() !== type || (name === "id" ? column.pk !== 1 : column.notnull !== 1 || column.pk !== 0)) {
         throw new Error("doctor: incompatible memories base-table structure");
       }
     }
     // Explicit columns also reject malformed *empty* tables rather than reporting health.
-    const records = db.prepare("SELECT id, text, tags, scope, pinned, created_at, updated_at, last_confirmed_at FROM memories ORDER BY updated_at DESC, id DESC").all().map(readRecord);
+    const records = db.prepare("SELECT id, text, tags, scope, pinned, created_at, updated_at, last_confirmed_at, revision FROM memories ORDER BY updated_at DESC, id DESC").all().map(readRecord);
     const scopes = visibleScopes(activeScope, config.autoProjectScope);
     const visible = records.filter((r) => scopes.includes(r.scope));
     const candidates = [...visible.filter((r) => r.pinned), ...visible.filter((r) => !r.pinned).slice(0, config.promptRecentCount)];

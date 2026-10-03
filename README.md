@@ -114,10 +114,46 @@ Compatible with `dsh-memory` habits:
 
 New:
 
-- `memory_update(id, text?, tags?, pinned?)` — revise in place, keeps the id
-- `memory_confirm(id | "*")` — refresh review timestamp, clear stale
+- `memory_update(id, text?, tags?, pinned?, expectedRevision?)` — revise in place, keeps the id
+- `memory_confirm(id | "*", expectedRevision?)` — refresh review timestamp, clear stale
 - `memory_list(scope?, tags?, stale?, limit?)` — filtered browse (tags AND)
-- `memory_merge(targetId, sourceIds[], text?, tags?)` — merge duplicates; tags default to the union
+- `memory_merge(targetId, sourceIds[], text?, tags?, expectedRevision?, expectedSourceRevisions?)` — merge duplicates; tags default to the union
+
+### Optimistic concurrency (revision CAS, phase 1)
+
+Every stored memory carries a `revision` (positive integer, starting at 1,
+independent of any clock). All reads — search results, list, prompt lines
+(`(#id, rev N, …)`), dedupe hits — and every successful write report it.
+Passing `expectedRevision` (the revision you last read) to
+`memory_update` / `memory_confirm` / `memory_forget` / `memory_merge` makes the
+mutation compare-and-swap inside one `BEGIN IMMEDIATE` transaction: if the
+record changed since you read it, the operation fails with a structured
+`MEMORY_REVISION_CONFLICT` (`{code, operation, id, expectedRevision,
+currentRevision}`) and **nothing** is written — no automatic retry of your old
+content. Re-read the record and retry with its current revision.
+
+- Omitting the version fields keeps the legacy, **unprotected** behavior; a
+  call without a version never claims CAS protection.
+- `memory_merge` in strict mode requires `expectedRevision` for the target and
+  `expectedSourceRevisions` covering exactly the unique source ids; partial,
+  duplicate, extra, or target entries are rejected before any read.
+- `memory_confirm` with `id: "*"` refreshes review timestamps only; it is not
+  a per-record verification and rejects `expectedRevision`.
+- Conflicts and unknown/deleted/out-of-scope ids are metadata-only failures
+  (codes: `MEMORY_REVISION_CONFLICT`, `MEMORY_NOT_FOUND`,
+  `MEMORY_INVALID_ARGUMENT`, `MEMORY_SCOPE_MISMATCH`,
+  `MEMORY_REVISION_OVERFLOW`); memory text is never included in errors.
+- Successful update/confirm/merge return the new revision; `memory_forget`
+  returns `deletedRevision` (the revision that was removed).
+- The revision counter has an upper bound (`Number.MAX_SAFE_INTEGER`); a record
+  at the ceiling can no longer be updated, confirmed, or a merge target — the
+  operation is rejected whole. Deletion is not blocked.
+
+Phase 1 limitations (see issue #32 for the staged plan): CAS only protects the
+version you observed; it does not prove content correctness, stages 2–4
+(provenance/evidence, layered review status, history/rollback) are not
+implemented, and there is no incarnation/tombstone protection across
+restore/import — quiesce writers and re-read after such operations.
 
 Prefer searching for an existing fact/topic before writing when its identity is not
 already known. A changed state of the **same fact** belongs in `memory_update`, not
@@ -144,11 +180,50 @@ Multiple sessions on one personal PC or server can share a local WAL database. O
 npx -p @tr1v3r/dsh-ltm dsh-ltm --db /path/to/ltm.db <command> [--json]
 ```
 
-`list / search / show / edit / tag / pin / merge / confirm / export / import` — every command supports `--json` for machine-readable output. Unknown flags, mutually exclusive flags, and surplus positional arguments are rejected. Default database: `$DSH_HOME/memory/ltm.db`.
+`list / search / show / edit / tag / pin / merge / confirm / forget / upgrade-schema / export / import` — every command supports `--json` for machine-readable output. Unknown flags, mutually exclusive flags, and surplus positional arguments are rejected. Default database: `$DSH_HOME/memory/ltm.db`.
 
-`export` emits `dsh-ltm-export/1`; `--out` must name a **new file**. Existing files (including symlinks and hardlinks) are never overwritten, and the active database and its SQLite sidecar paths are reserved even when absent. Choose a new backup filename for each export. Without `--out`, JSON goes to stdout; shell redirection is outside this protection, so never redirect to a database or an existing backup.
+`edit`/`tag`/`pin`/`confirm <id>`/`forget` accept `--expected-revision N`, and
+`merge` additionally accepts `--expected-source-revisions id:rev,id:rev`
+(exactly the unique sources). The flags are validated before the database is
+opened; `confirm --all --expected-revision` is rejected. CAS failures exit 1
+with the same structured `error` detail the tools return (JSON) or a
+metadata-only line (codes/id/versions plus a re-read hint, never unrequested
+text). Successful `show`/`list`/`search`/`edit`/`tag`/`pin`/`merge` output the
+revision; `confirm <id>` reports `confirmed` + `revision`, `--all` only a
+count; `forget` reports `deleted` + `deletedRevision`.
 
-`import` validates the complete payload and restores IDs, timestamps, normalized tags, scope, pinned state, and stale lifecycle. Re-importing an identical ID is skipped; an ID whose stored value differs aborts the entire import without partial writes.
+#### Schema upgrade (v1 → v2)
+
+Databases created before the revision column (schema v1) are **never upgraded
+implicitly**: opening one with a normal store/plugin/CLI command is refused
+read-only with a pointer to the explicit upgrade. Stop all writers (including
+running plugins), then:
+
+```sh
+dsh-ltm --db /path/to/ltm.db upgrade-schema            # backup beside the db by default
+dsh-ltm --db /path/to/ltm.db upgrade-schema --backup /path/to/new-backup.db
+```
+
+The command classifies the database on a read-only connection (unknown,
+malformed, fake-v1, and newer schemas are refused with the main database and
+committed WAL bytes untouched), takes one SQLite-consistent backup via
+read-only `VACUUM INTO` (default name `<db>.pre-v2-backup-<UTC timestamp>`,
+never overwriting an existing file or targeting the database/sidecars), and
+applies `ALTER TABLE memories ADD COLUMN revision …` plus the
+`meta.schema_version = '2'` stamp in a single transaction after re-verifying
+the v1 structure under the write lock. Old rows keep their text, timestamps,
+scope, tags, and pinned state, and start at revision 1; `fts_token_version` is
+untouched. A failure rolls back with no half-upgraded state and keeps the
+backup. Rollback is manual: stop writers and restore the backup snapshot
+(writes performed after the upgrade are lost). Already-current databases are a
+metadata-only no-op; missing or empty databases are never created by this
+command. The old `dsh-memory` → dsh-ltm one-shot migration is a separate
+repo-only utility (below).
+
+`export` emits `dsh-ltm-export/2` (every record carries its `revision`);
+`--out` must name a **new file**. Existing files (including symlinks and hardlinks) are never overwritten, and the active database and its SQLite sidecar paths are reserved even when absent. Choose a new backup filename for each export. Without `--out`, JSON goes to stdout; shell redirection is outside this protection, so never redirect to a database or an existing backup.
+
+`import` accepts both `dsh-ltm-export/1` (records without a revision are restored at revision 1; a provided revision is validated, never ignored) and `/2` (revision required and preserved). It validates the complete payload and restores IDs, timestamps, normalized tags, scope, pinned state, review lifecycle, and revisions. Re-importing an identical ID (all fields including revision) is skipped; an ID whose stored value differs aborts the entire import without partial writes — imports never overwrite an existing id with a different revision. Restore/import is an administrative recovery boundary: CAS tokens do not survive backups or re-imports of deleted ids (no tombstones in phase 1), so quiesce and re-read after such operations.
 
 ### Read-only quality doctor
 
