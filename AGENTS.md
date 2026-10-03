@@ -56,7 +56,15 @@ Changes to plugin wiring or tool schemas must also pass the real boot probe;
   format change should rebuild the derived FTS index, not silently alter data.
 - Preflight existing databases read-only and fail closed on unknown, malformed,
   older-without-migration, or newer schemas. Refusal must not rewrite the main
-  database or committed WAL bytes.
+  database or committed WAL bytes. The single supported exception is the
+  explicit v1 → v2 upgrade (issue #32 phase 1): a v1 database is refused by
+  every normal open (read-only, pointing at `dsh-ltm upgrade-schema`) and
+  upgraded only through `upgradeSchema`, which classifies on a read-only
+  handle, backs up via read-only `VACUUM INTO`, and commits the
+  `revision` column plus the `meta.schema_version = '2'` stamp in one
+  transaction after re-verifying the v1 structure under the write lock. This
+  exception must not be widened into implicit upgrades or any other older
+  schema being accepted without an explicit, backed-up migration path.
 - Legacy migration must open the source read-only and use a SQLite-consistent
   snapshot; never mutate or checkpoint the old `dsh-memory` database.
 - `stale` is derived from `lastConfirmedAt`; do not add a persisted stale flag.
