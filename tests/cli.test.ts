@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { runCli } from "../src/cli.js";
 import { MemoryStore } from "../src/store.js";
 
@@ -37,6 +37,47 @@ const stdout = () => chunks.join("");
 const resetOut = () => { chunks.length = 0; errChunks.length = 0; };
 
 describe("cli", () => {
+  it.each([false, true])("preserves symlink/.. database traversal (relative=%s)", async (relativePath) => {
+    const target = join(dir, "target");
+    mkdirSync(join(target, "child"), { recursive: true });
+    symlinkSync(join(target, "child"), join(dir, "alias"), "dir");
+    const intended = join(target, "ltm.db");
+    const decoy = db();
+    for (const [path, text] of [[intended, "intended memory"], [decoy, "decoy memory"]] as const) {
+      const store = new MemoryStore(path);
+      try { store.write(text, []); } finally { store.close(); }
+    }
+    const decoyBefore = readFileSync(decoy);
+    // Do not use join here: it would erase the traversal being tested.
+    const prefix = relativePath ? relative(process.cwd(), dir) : dir;
+    const path = `${prefix}/alias/../ltm.db`;
+    expect(await runCli(["--db", path, "show", "1", "--json"])).toBe(0);
+    expect(JSON.parse(stdout()).record.text).toBe("intended memory");
+    resetOut();
+    expect(await runCli(["--db", path, "edit", "1", "--text", "updated intended memory", "--expected-revision", "1", "--json"])).toBe(0);
+    expect(JSON.parse(stdout()).record).toMatchObject({ text: "updated intended memory", revision: 2 });
+    expect(readFileSync(decoy)).toEqual(decoyBefore);
+    const store = new MemoryStore(intended);
+    try { expect(store.list()[0]).toMatchObject({ text: "updated intended memory", revision: 2 }); }
+    finally { store.close(); }
+  });
+
+  it("creates a missing database at the symlink/.. destination, not its lexical alias", async () => {
+    const target = join(dir, "target");
+    mkdirSync(join(target, "child"), { recursive: true });
+    symlinkSync(join(target, "child"), join(dir, "alias"), "dir");
+    expect(await runCli(["--db", `${dir}/alias/../new.db`, "list", "--json"])).toBe(0);
+    expect(existsSync(join(target, "new.db"))).toBe(true);
+    expect(existsSync(join(dir, "new.db"))).toBe(false);
+  });
+
+  it("keeps ordinary relative database paths and missing parent creation working", async () => {
+    const path = relative(process.cwd(), join(dir, "new", "ltm.db"));
+    expect(await runCli(["--db", path, "list", "--json"])).toBe(0);
+    expect(JSON.parse(stdout())).toEqual({ records: [] });
+    expect(existsSync(join(dir, "new", "ltm.db"))).toBe(true);
+  });
+
   it("help subcommand and --help both exit 0", async () => {
     expect(await runCli(["help"])).toBe(0);
     expect(stdout()).toContain("usage:");
