@@ -8,7 +8,7 @@
  */
 
 import { realpathSync } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 /** Which database-relative target class a candidate output path collides with. */
 export type OutputDatabaseConflict = "database" | "sidecar";
@@ -26,12 +26,17 @@ export function outputConflictsWithDatabase(
   // Resolve the raw parent through the filesystem before normalizing: lexical
   // resolve() would collapse a symlink/.. pair to the wrong directory.
   const target = join(realpathSync.native(dirname(output)), basename(output));
-  const databasePaths = [resolve(dbPath), realpathSync.native(dbPath)];
+  // Keep the supplied basename to reserve alias sidecars, but resolve its raw
+  // parent through the filesystem before any lexical normalization. Also guard
+  // the real database name when the basename itself is a symlink.
+  const databasePaths = [
+    join(realpathSync.native(dirname(dbPath)), basename(dbPath)),
+    realpathSync.native(dbPath),
+  ];
   const filenameKey = (path: string) => path.normalize("NFC").toLowerCase();
   for (const database of databasePaths) {
-    const canonical = join(realpathSync(dirname(database)), basename(database));
     for (const suffix of ["", "-wal", "-shm", "-journal"]) {
-      if (filenameKey(target) === filenameKey(canonical + suffix)) {
+      if (filenameKey(target) === filenameKey(database + suffix)) {
         return suffix === "" ? "database" : "sidecar";
       }
     }

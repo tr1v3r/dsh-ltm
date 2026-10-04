@@ -156,6 +156,9 @@ function parseArgv(argv: readonly string[]): ParsedArgs {
     }
   }
   if (parsed.command !== undefined) {
+    if (!Object.hasOwn(COMMAND_FLAGS, parsed.command)) {
+      fail(`unknown command ${JSON.stringify(parsed.command)}`);
+    }
     const spec = COMMAND_FLAGS[parsed.command];
     if (spec !== undefined) {
       const allowedValues = new Set(spec.values ?? []);
@@ -168,6 +171,9 @@ function parseArgv(argv: readonly string[]): ParsedArgs {
         if (flag === "help") continue;
         if (!allowedBools.has(flag)) fail(`${parsed.command}: unknown flag --${flag}`);
       }
+      // Help is informational: do not require operation arguments or validate
+      // their combinations. Keep option spelling/value syntax checks above.
+      if (parsed.boolFlags.has("help")) return parsed;
       if (parsed.positionals.length < spec.min) fail(`${parsed.command}: missing argument`);
       if (spec.max !== undefined && parsed.positionals.length > spec.max) {
         fail(`${parsed.command}: unexpected argument ${JSON.stringify(parsed.positionals[spec.max])}`);
@@ -430,7 +436,9 @@ export async function runCli(argv: readonly string[]): Promise<number> {
     }
     const config = loadConfig({
       ...overrides,
-      path: parsed.db !== undefined ? resolve(parsed.db) : Object.hasOwn(overrides, "path") ? overrides.path : defaultDbPath(),
+      // Preserve filesystem traversal: resolving lexically would collapse
+      // symlink/.. and could silently select a different database.
+      path: parsed.db !== undefined ? parsed.db : Object.hasOwn(overrides, "path") ? overrides.path : defaultDbPath(),
     });
 
     // CAS flags are fully parsed (including merge source coverage) before the
