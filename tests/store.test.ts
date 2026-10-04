@@ -367,6 +367,72 @@ describe("CJK search (R2)", () => {
 });
 
 describe("hybrid rerank (R3 default tier)", () => {
+  it("applies the requested limit after reranking equal-BM25 candidates", () => {
+    const store = open();
+    store.write("beta alpha", [], { force: true });
+    const exact = store.write("alpha beta", [], { force: true }).record;
+    const full = store.search("alpha beta", 10);
+    expect(full[0]!.id).toBe(exact.id);
+    expect(store.search("alpha beta", 1)).toEqual(full.slice(0, 1));
+  });
+
+  it("keeps prefixes and normalized scores stable below, at, and above the output cap", () => {
+    const store = open({ searchLimitMax: 3 });
+    for (const text of ["alpha", "alpha alpha", "alpha beta", "beta alpha extra words", "beta"]) {
+      store.write(text, [], { force: true });
+    }
+    const full = store.search("alpha beta", 3);
+    expect(full).toHaveLength(3);
+    expect(new Set(full.map((hit) => hit.ftsRank)).size).toBeGreaterThan(1);
+    for (const limit of [1, 2, 3, 4, 1000]) {
+      expect(store.search("alpha beta", limit)).toEqual(full.slice(0, Math.min(limit, 3)));
+    }
+  });
+
+  it.each([50, 250])("bounds candidates and breaks BM25/cosine ties by ID (output cap %i)", (cap) => {
+    const store = open({ searchLimitMax: cap });
+    const budget = Math.max(200, cap);
+    const ids: number[] = [];
+    for (let i = 0; i < budget; i++) {
+      ids.push(store.write("beta alpha", [], { force: true }).record.id);
+    }
+    // Same BM25, better cosine, but outside the deterministic bounded pool.
+    // This explicitly tests bounded retrieval rather than unlimited reranking.
+    store.write("alpha beta", [], { force: true });
+    const full = store.search("alpha beta", cap);
+    expect(full.map((hit) => hit.id)).toEqual(ids.slice(0, cap));
+    expect(store.search("alpha beta", 1)).toEqual(full.slice(0, 1));
+    expect(store.search("alpha beta", cap + 100)).toEqual(full);
+  });
+
+  it("reranks the entire candidate floor even with an output cap of one", () => {
+    const store = open({ searchLimitMax: 1 });
+    for (let i = 0; i < 199; i++) store.write("beta alpha", [], { force: true });
+    const exact = store.write("alpha beta", [], { force: true }).record;
+    expect(store.search("alpha beta", 1)[0]!.id).toBe(exact.id);
+  });
+
+  it("filters scopes before the bounded pool and preserves CJK prefixes", () => {
+    const store = open({ searchLimitMax: 3 });
+    for (let i = 0; i < 201; i++) {
+      store.write("长期记忆", [], { force: true, scope: "other" });
+    }
+    const global = store.write("长期记忆", [], { scope: "" }).record;
+    const project = store.write("长期记忆系统", [], { scope: "project" }).record;
+    store.write("记忆插件", [], { scope: "project" });
+    for (const scopes of ["project", ["", "project", "project"]] as const) {
+      const full = store.search("长期记忆", 3, scopes);
+      expect(full.map((hit) => hit.id)).toContain(project.id);
+      expect(full.every((hit) => hit.scope !== "other")).toBe(true);
+      for (const limit of [1, 2, 3, 1000]) {
+        expect(store.search("长期记忆", limit, scopes)).toEqual(full.slice(0, Math.min(limit, 3)));
+      }
+    }
+    expect(store.search("长期记忆", 3, ["", "project"]).map((hit) => hit.id)).toContain(global.id);
+    expect(store.search("长期记忆", 3, [])).toEqual([]);
+    expect(store.search("长期记忆", 3, "missing")).toEqual([]);
+  });
+
   it("gives a better negative FTS5 rank a larger BM25 component", () => {
     const store = open();
     store.write("alpha alpha alpha focused", [], { force: true });
