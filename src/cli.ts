@@ -156,6 +156,9 @@ function parseArgv(argv: readonly string[]): ParsedArgs {
     }
   }
   if (parsed.command !== undefined) {
+    if (!Object.hasOwn(COMMAND_FLAGS, parsed.command)) {
+      fail(`unknown command ${JSON.stringify(parsed.command)}`);
+    }
     const spec = COMMAND_FLAGS[parsed.command];
     if (spec !== undefined) {
       const allowedValues = new Set(spec.values ?? []);
