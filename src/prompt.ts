@@ -21,6 +21,9 @@ const HEADER =
 /**
  * Render one memory as a prompt line. `stale` flags records due for a
  * `memory_confirm` review so the model can refresh them opportunistically.
+ * A record carrying its persisted `revision` (every store read) renders it
+ * as `rev N` so the model can quote it back for optimistic-concurrency
+ * updates; legacy hand-built records without one render exactly as before.
  *
  * @param record - the memory to render.
  * @param escapeSequences - opt-in output sequences broken with a zero-width space.
@@ -32,6 +35,7 @@ export function promptLine(
   staleAfterDays: number,
 ): string {
   const flags: string[] = [];
+  if (record.revision !== undefined) flags.push(`rev ${record.revision}`);
   if (record.pinned) flags.push("pinned");
   if (isStale(record, staleAfterDays)) flags.push("stale");
   const flagText = flags.length > 0 ? `, ${flags.join(", ")}` : "";

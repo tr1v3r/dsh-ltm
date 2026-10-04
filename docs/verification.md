@@ -60,11 +60,28 @@ createLaunchEnvironmentSnapshot([...process.env]))`。收尾用 `ctx.fiber.dispo
 
 P1（核心引擎）+ P1'（插件面）联合验证通过：全测试矩阵绿、真实 boot 七工具全链路（含中文及 registry 输出校验）通过、真实旧库迁移只读且原库字节不变。上述 F1–F6 均已收敛，可以进入后续评审。
 
+## 6. issue #32 阶段一（revision CAS）验证增补
+
+日期：2026-10 · 同机同 Node。新增测试面与结果：
+
+| 检查 | 覆盖 | 结果 |
+|---|---|---|
+| `tests/cas.test.ts`（store 层） | 双连接同读 v1 后 A 成功 v2、B expected 1 冲突且正文/时间/FTS/revision 全保留；冻结时钟同毫秒 1→2→3→4→5 可区分；dedupe/空 patch/同值 patch/confirm/`*`/merge 的递增规则；只读路径不递增；MAX 上限（update/confirm/merge 目标整次拒绝、`*` 任一可见行 MAX 全批失败、MAX forget/源删除仍可用）；畸形版本（0/负/小数/NaN/Infinity/字符串/null/超界）一律 INVALID_ARGUMENT；CAS 未知/已删除/越权统一 NOT_FOUND 无 currentRevision；旧版本 confirm 不能确认新正文、旧版本 forget 不能删新记录；严格 merge（目标/任一源冲突、缺源、越权、跨 scope、部分/重复/多余/only-target/空/畸形声明）零写入 | ✅ 全绿 |
+| `tests/upgrade-schema.test.ts` | 真实 v1 库（含未 checkpoint WAL）：普通打开只读拒绝且字节不变；升级后旧行 revision=1、正文/时间戳/scope/tags/pinned/ids/FTS 检索全保留；默认与显式备份（`VACUUM INTO` 一致快照）；备份覆盖/指向库本体/sidecar/既有文件拒绝；ALTER/COMMIT 失败回滚列+版本戳且保留备份；锁后并发升级重验（已升级→already-current）；结构中途变更 fail loud；unknown/畸形/较新/伪造 v1/带 revision 的假 v1 拒绝且 main+WAL sha256 不变；empty/缺失库不创建 | ✅ 全绿 |
+| `tests/cas-tools.test.ts`（工具层） | 四个变更工具的注册输出 schema（memory{Update,Confirm,Forget,Merge}OutputSchema）与实际值经 `validateJsonSchemaValue` 一致；结构化 error 原字段 false/0 保留、无 record/budget；`*`+版本拒绝；dedupe/记录/搜索投影携带 revision；跨项目隔离下 CAS 失败仅元数据 | ✅ 全绿 |
+| `tests/cli-cas.test.ts` | `--expected-revision` 全命令生命周期与冲突（--json 结构化 error、人类模式仅码/版本/重读指引）；畸形 flag 在建库前拒绝；merge `--expected-source-revisions` 八类反例；export `/2` 往返、import `/1`（缺省 1/带版本校验）、`/2` 缺版本拒绝、同 id 异 revision 整批回滚；upgrade-schema CLI 全流程与反例 | ✅ 全绿 |
+| 真实 boot 探针 | 读版本→CAS 成功→结构化冲突（registry 校验通过、渲染含码与重读指引、零写入）→严格 merge 成功/陈旧拒绝→CAS confirm/forget→`*`+版本拒绝→跨 scope NOT_FOUND 无版本披露→跨项目 memory_list 聚合不回退 | ✅ 新增 16 断言全 PASS |
+
+阶段一明确未做（非目标）：provenance/evidence/hash（阶段二）、来源变化/争议持久状态（阶段三）、
+历史/actor/回滚（阶段四）；forget 仍真正删除正文+FTS，无新增正文历史或敏感留存；无强制网络。
+
 ## 附：复现命令
 
 ```sh
 pnpm typecheck && pnpm test && pnpm build
-node probe/boot-probe.mjs                       # 真实 boot 探针（21 断言）
+node probe/boot-probe.mjs                       # 真实 boot 探针（含 CAS 链）
+node bin/dsh-ltm.mjs --help
+node --test .github/scripts/check-packed.cases.mjs
 cp ~/.config/dsh/memory/memory.db* /tmp/ltm-src/
 pnpm exec tsx scripts/legacy-migration/cli.ts --source /tmp/ltm-src/memory.db --db /tmp/ltm-src/ltm.db
 node bin/dsh-ltm.mjs search "数据库" --db /tmp/ltm-src/ltm.db --json

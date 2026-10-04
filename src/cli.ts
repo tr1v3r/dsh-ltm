@@ -14,6 +14,9 @@ import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { loadConfig } from "./config.js";
 import { MemoryStore } from "./store.js";
+import { MemoryMutationError, type MemoryMutationErrorDetail } from "./errors.js";
+import { upgradeSchema } from "./upgrade.js";
+import { outputConflictsWithDatabase } from "./output-path.js";
 import { isStale } from "./prompt.js";
 import type { Config, MemoryRecord } from "./contracts.js";
 import { normalizeTags } from "./tokenize.js";
@@ -31,6 +34,9 @@ const VALUE_FLAGS = new Set([
   "--limit",
   "--file",
   "--out",
+  "--expected-revision",
+  "--expected-source-revisions",
+  "--backup",
 ]);
 
 /** Usage text shown for `help` or a parse error. */
@@ -41,11 +47,14 @@ commands:
   list [--scope S] [--tags a,b] [--stale|--fresh] [--pinned] [--limit N]
   search <query> [--limit N]
   show <id>
-  edit <id> --text <text>
-  tag <id> --tags a,b            (replaces the tag set)
-  pin <id> [--off]
+  edit <id> --text <text> [--expected-revision N]
+  tag <id> --tags a,b            (replaces the tag set) [--expected-revision N]
+  pin <id> [--off] [--expected-revision N]
   merge <targetId> <sourceId>... [--text <text>] [--tags a,b]
-  confirm <id>|--all
+        [--expected-revision N] [--expected-source-revisions id:rev,id:rev]
+  confirm <id>|--all [--expected-revision N]  (revision only with <id>)
+  forget <id> [--expected-revision N]
+  upgrade-schema [--backup NEW_PATH]   (explicit v1 -> v2; backs up first)
   export [--out <file>]          (JSON to stdout or a new file; never overwrites)
   import <file>                  (JSON produced by export)
   help
@@ -81,11 +90,13 @@ const COMMAND_FLAGS: Record<string, { values?: readonly string[]; bools?: readon
   list: { values: ["scope", "tags", "limit"], bools: ["stale", "fresh", "pinned"], min: 0, max: 0 },
   search: { values: ["limit"], min: 1 },
   show: { min: 1, max: 1 },
-  edit: { values: ["text"], min: 1, max: 1 },
-  tag: { values: ["tags"], min: 1, max: 1 },
-  pin: { bools: ["off"], min: 1, max: 1 },
-  merge: { values: ["text", "tags"], min: 2 },
-  confirm: { bools: ["all"], min: 0, max: 1 },
+  edit: { values: ["text", "expected-revision"], min: 1, max: 1 },
+  tag: { values: ["tags", "expected-revision"], min: 1, max: 1 },
+  pin: { values: ["expected-revision"], bools: ["off"], min: 1, max: 1 },
+  merge: { values: ["text", "tags", "expected-revision", "expected-source-revisions"], min: 2 },
+  confirm: { values: ["expected-revision"], bools: ["all"], min: 0, max: 1 },
+  forget: { values: ["expected-revision"], min: 1, max: 1 },
+  "upgrade-schema": { values: ["backup"], min: 0, max: 0 },
   export: { values: ["out"], min: 0, max: 0 },
   import: { min: 1, max: 1 },
   help: { min: 0, max: 0 },
@@ -167,9 +178,87 @@ function parseArgv(argv: readonly string[]): ParsedArgs {
       if (parsed.command === "confirm" && parsed.boolFlags.has("all") && parsed.positionals.length > 0) {
         fail("confirm: <id> and --all are mutually exclusive");
       }
+      if (parsed.command === "confirm" && parsed.boolFlags.has("all") &&
+          Object.hasOwn(parsed.flags, "expected-revision")) {
+        fail("confirm: --all and --expected-revision are mutually exclusive ('*' refreshes timestamps and does not verify one version)");
+      }
     }
   }
   return parsed;
+}
+
+/** Parsed CAS options shared by the mutating commands. */
+interface CasOptions {
+  expectedRevision?: number;
+  expectedSourceRevisions?: Array<{ id: number; revision: number }>;
+}
+
+/**
+ * Parse and validate CAS flags as early as possible — before the config is
+ * loaded and the database opened — so a malformed version can never be
+ * silently treated as "no version" on a real store.
+ */
+function parseCasOptions(parsed: ParsedArgs): CasOptions {
+  const cas: CasOptions = {};
+  const raw = parsed.flags["expected-revision"];
+  if (raw !== undefined) {
+    const n = Number(raw);
+    if (!Number.isSafeInteger(n) || n < 1) {
+      fail(`--expected-revision must be a positive safe integer (got ${JSON.stringify(raw)})`);
+    }
+    cas.expectedRevision = n;
+  }
+  const rawSources = parsed.flags["expected-source-revisions"];
+  if (rawSources !== undefined) {
+    const entries: Array<{ id: number; revision: number }> = [];
+    const seen = new Set<number>();
+    for (const part of rawSources.split(",")) {
+      const token = part.trim();
+      const match = /^([0-9]+):([0-9]+)$/.exec(token);
+      if (token.length === 0 || match === null) {
+        fail(`--expected-source-revisions must look like id:rev,id:rev (got ${JSON.stringify(part)})`);
+      }
+      const id = Number(match[1]);
+      const revision = Number(match[2]);
+      if (!Number.isSafeInteger(id) || id < 1 || !Number.isSafeInteger(revision) || revision < 1) {
+        fail(`--expected-source-revisions ids and revisions must be positive safe integers (got ${JSON.stringify(part)})`);
+      }
+      if (seen.has(id)) {
+        fail(`--expected-source-revisions declares id #${id} more than once`);
+      }
+      seen.add(id);
+      entries.push({ id, revision });
+    }
+    if (entries.length === 0) {
+      fail("--expected-source-revisions must declare at least one id:rev pair");
+    }
+    cas.expectedSourceRevisions = entries;
+  }
+  // Strict-mode completeness is checked against the positional ids the moment
+  // they are known; still before any database access.
+  if (parsed.command === "merge") {
+    const targetId = toInt(parsed.positionals[0], "targetId");
+    const sourceIds = parsed.positionals.slice(1).map((v) => toInt(v, "sourceId"));
+    const unique = new Set(sourceIds.filter((id) => id !== targetId));
+    if (cas.expectedRevision !== undefined || cas.expectedSourceRevisions !== undefined) {
+      if (cas.expectedRevision === undefined) {
+        fail("merge: --expected-source-revisions requires --expected-revision for the target");
+      }
+      if (cas.expectedSourceRevisions === undefined) {
+        fail("merge: --expected-revision requires --expected-source-revisions covering every source");
+      }
+      for (const entry of cas.expectedSourceRevisions) {
+        if (entry.id === targetId) fail("merge: --expected-source-revisions must not declare the target id");
+        if (!unique.has(entry.id)) fail(`merge: --expected-source-revisions declares #${entry.id}, which is not a source`);
+      }
+      for (const id of unique) {
+        if (!cas.expectedSourceRevisions.some((entry) => entry.id === id)) {
+          fail(`merge: --expected-source-revisions is missing source #${id}`);
+        }
+      }
+    }
+  }
+  return cas;
 }
 
 function defaultDbPath(): string {
@@ -197,9 +286,11 @@ function toId(value: string | undefined): number {
 function parseImportPayload(value: unknown): MemoryRecord[] {
   if (typeof value !== "object" || value === null || Array.isArray(value)) fail("import: not an export file");
   const payload = value as Record<string, unknown>;
-  if (payload.format !== "dsh-ltm-export/1" || !Array.isArray(payload.records)) {
+  const format = payload.format;
+  if (format !== "dsh-ltm-export/1" && format !== "dsh-ltm-export/2") {
     fail("import: unsupported or invalid export format");
   }
+  if (!Array.isArray(payload.records)) fail("import: unsupported or invalid export format");
   const seen = new Set<number>();
   return payload.records.map((raw, index) => {
     if (typeof raw !== "object" || raw === null || Array.isArray(raw)) fail(`import: invalid record at index ${index}`);
@@ -222,7 +313,21 @@ function parseImportPayload(value: unknown): MemoryRecord[] {
     const updatedAt = integer("updatedAt");
     const lastConfirmedAt = integer("lastConfirmedAt");
     if (updatedAt < createdAt) fail(`import: record ${index} has updatedAt before createdAt`);
-    return { id, text: record.text, tags: record.tags, scope: record.scope, pinned: record.pinned, createdAt, updatedAt, lastConfirmedAt };
+    // v2 requires the revision on every record; v1 files never carried one
+    // (restored at 1), but a v1 file that DOES carry one is validated, never
+    // silently ignored.
+    const hasRevision = Object.hasOwn(record, "revision");
+    if (format === "dsh-ltm-export/2" && !hasRevision) {
+      fail(`import: record ${index} is missing revision (required by dsh-ltm-export/2)`);
+    }
+    const result: MemoryRecord = {
+      id, text: record.text, tags: record.tags, scope: record.scope,
+      pinned: record.pinned, createdAt, updatedAt, lastConfirmedAt,
+    };
+    if (hasRevision) {
+      result.revision = integer("revision", true);
+    }
+    return result;
   });
 }
 
@@ -234,10 +339,12 @@ function humanLine(
     tags: string;
     pinned: boolean;
     lastConfirmedAt: number;
+    revision?: number;
   },
   staleAfterDays: number,
 ): string {
   const flags = [
+    record.revision !== undefined ? `rev ${record.revision}` : "",
     record.pinned ? "pinned" : "",
     isStale(record, staleAfterDays) ? "stale" : "",
   ].filter(Boolean).join(",");
@@ -258,19 +365,10 @@ function out(json: boolean, data: unknown, human: string): void {
  * would break the next database writer. Canonicalize parent-directory aliases.
  */
 function writeExportFile(file: string, payload: string, dbPath: string): void {
-  // Resolve the raw parent through the filesystem before normalizing: lexical
-  // resolve() would collapse a symlink/.. pair to the wrong directory.
-  const output = join(realpathSync.native(dirname(file)), basename(file));
-  const databasePaths = [resolve(dbPath), realpathSync.native(dbPath)];
-  const filenameKey = (path: string) => path.normalize("NFC").toLowerCase();
-  for (const database of databasePaths) {
-    const canonical = join(realpathSync(dirname(database)), basename(database));
-    // Reserve case/Unicode-normalization variants conservatively even on
-    // case-sensitive hosts, covering absent filename aliases on macOS too.
-    if (["", "-wal", "-shm", "-journal"].some((suffix) => filenameKey(output) === filenameKey(canonical + suffix))) {
-      fail("export: --out must not target the database or its SQLite sidecars");
-    }
+  if (outputConflictsWithDatabase(file, dbPath) !== undefined) {
+    fail("export: --out must not target the database or its SQLite sidecars");
   }
+  const output = join(realpathSync.native(dirname(file)), basename(file));
   try {
     // Exclusive creation also closes the check-then-truncate race and rejects
     // dangling symlinks without following them.
@@ -281,6 +379,17 @@ function writeExportFile(file: string, payload: string, dbPath: string): void {
     }
     throw error;
   }
+}
+
+/**
+ * Report a typed domain failure the way the model-facing tools do: the same
+ * structured `error` detail for --json, a metadata-only human line (code, id,
+ * versions, re-read guidance) otherwise. Exit code 1; nothing else is printed.
+ */
+function reportMutationError(json: boolean, error: MemoryMutationError): number {
+  const detail: MemoryMutationErrorDetail = { ...error.detail };
+  out(json, { error: detail }, error.message);
+  return 1;
 }
 
 function openStore(config: Config): MemoryStore {
@@ -324,6 +433,25 @@ export async function runCli(argv: readonly string[]): Promise<number> {
       path: parsed.db !== undefined ? resolve(parsed.db) : Object.hasOwn(overrides, "path") ? overrides.path : defaultDbPath(),
     });
 
+    // CAS flags are fully parsed (including merge source coverage) before the
+    // database is opened; a malformed version never reaches a real store.
+    const cas = parseCasOptions(parsed);
+
+    if (command === "upgrade-schema") {
+      const backup = flags.backup;
+      const report = upgradeSchema(config.path, backup === undefined ? undefined : { backupPath: backup });
+      out(
+        json,
+        report,
+        report.upgraded
+          ? `upgraded ${config.path} to schema v${report.schemaVersion} (${report.recordCount} records); backup at ${report.backupPath}`
+          : report.backupPath === undefined
+            ? `${config.path} is already at schema v${report.schemaVersion}; nothing to do`
+            : `${config.path} is already at schema v${report.schemaVersion}; nothing to do — this run still kept its pre-taken backup at ${report.backupPath} (delete it after review if unneeded)`,
+      );
+      return 0;
+    }
+
     if (command === "doctor") {
       const activeScope = flags.scope ?? (config.autoProjectScope
         ? resolveProjectScope(process.cwd(), config.defaultScope).scope : config.defaultScope);
@@ -335,6 +463,29 @@ export async function runCli(argv: readonly string[]): Promise<number> {
       };
       out(json, report, JSON.stringify(report, null, 2));
       return 0;
+    }
+
+    // `import` validates its whole payload (file, JSON, record shape,
+    // revisions) before the store is opened: an invalid input must not even
+    // create the target database or its parent directory. The validated
+    // records are reused for the atomic import below.
+    let preparedImport: MemoryRecord[] | undefined;
+    if (command === "import") {
+      const file = positionals[0];
+      if (file === undefined) fail("import: missing <file>");
+      let raw: string;
+      try {
+        raw = readFileSync(resolve(file), "utf8");
+      } catch {
+        fail(`import: cannot read ${JSON.stringify(file)}`);
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        fail("import: file is not valid JSON");
+      }
+      preparedImport = parseImportPayload(parsed);
     }
 
     const store = openStore(config);
@@ -397,6 +548,7 @@ export async function runCli(argv: readonly string[]): Promise<number> {
             `  created: ${new Date(record.createdAt).toISOString()}`,
             `  updated: ${new Date(record.updatedAt).toISOString()}`,
             `  confirmed: ${new Date(record.lastConfirmedAt).toISOString()}`,
+            `  revision: ${record.revision}`,
           ].join("\n"));
           return 0;
         }
@@ -404,35 +556,53 @@ export async function runCli(argv: readonly string[]): Promise<number> {
           const id = toId(positionals[0]);
           const text = flags.text;
           if (text === undefined) fail("edit: missing --text");
-          const record = store.update(id, { text });
+          let record;
+          try {
+            record = store.update(id, { text }, undefined, cas.expectedRevision === undefined ? undefined : { expectedRevision: cas.expectedRevision });
+          } catch (error) {
+            if (error instanceof MemoryMutationError) return reportMutationError(json, error);
+            throw error;
+          }
           if (record === undefined) {
             out(json, { error: `no memory #${id}` }, `no memory #${id}`);
             return 1;
           }
-          out(json, { record }, `updated #${id}`);
+          out(json, { record }, `updated #${id} (rev ${record.revision})`);
           return 0;
         }
         case "tag": {
           const id = toId(positionals[0]);
           const tags = splitTags(flags.tags);
           if (tags === undefined) fail("tag: missing --tags");
-          const record = store.update(id, { tags });
+          let record;
+          try {
+            record = store.update(id, { tags }, undefined, cas.expectedRevision === undefined ? undefined : { expectedRevision: cas.expectedRevision });
+          } catch (error) {
+            if (error instanceof MemoryMutationError) return reportMutationError(json, error);
+            throw error;
+          }
           if (record === undefined) {
             out(json, { error: `no memory #${id}` }, `no memory #${id}`);
             return 1;
           }
-          out(json, { record }, `#${id} tags: ${record.tags || "(none)"}`);
+          out(json, { record }, `#${id} tags: ${record.tags || "(none)"} (rev ${record.revision})`);
           return 0;
         }
         case "pin": {
           const id = toId(positionals[0]);
           const pinned = !boolFlags.has("off");
-          const record = store.update(id, { pinned });
+          let record;
+          try {
+            record = store.update(id, { pinned }, undefined, cas.expectedRevision === undefined ? undefined : { expectedRevision: cas.expectedRevision });
+          } catch (error) {
+            if (error instanceof MemoryMutationError) return reportMutationError(json, error);
+            throw error;
+          }
           if (record === undefined) {
             out(json, { error: `no memory #${id}` }, `no memory #${id}`);
             return 1;
           }
-          out(json, { record }, `#${id} ${pinned ? "pinned" : "unpinned"}`);
+          out(json, { record }, `#${id} ${pinned ? "pinned" : "unpinned"} (rev ${record.revision})`);
           return 0;
         }
         case "merge": {
@@ -444,28 +614,64 @@ export async function runCli(argv: readonly string[]): Promise<number> {
             sourceIds: number[];
             text?: string;
             tags?: string[];
+            expectedRevision?: number;
+            expectedSourceRevisions?: Array<{ id: number; revision: number }>;
           } = { targetId, sourceIds };
           if (flags.text !== undefined) mergeInput.text = flags.text;
           const tags = splitTags(flags.tags);
           if (tags !== undefined) mergeInput.tags = tags;
-          const record = store.merge(mergeInput);
+          if (cas.expectedRevision !== undefined) mergeInput.expectedRevision = cas.expectedRevision;
+          if (cas.expectedSourceRevisions !== undefined) mergeInput.expectedSourceRevisions = cas.expectedSourceRevisions;
+          let record;
+          try {
+            record = store.merge(mergeInput);
+          } catch (error) {
+            if (error instanceof MemoryMutationError) return reportMutationError(json, error);
+            throw error;
+          }
           if (record === undefined) {
             out(json, { error: "merge failed (bad ids?)" }, "merge failed");
             return 1;
           }
-          out(json, { record }, `merged into #${record.id}`);
+          out(json, { record }, `merged into #${record.id} (rev ${record.revision})`);
           return 0;
         }
         case "confirm": {
           const all = boolFlags.has("all");
-          const confirmed = store.confirm(all ? "*" : toId(positionals[0]));
-          out(json, { confirmed }, `confirmed ${confirmed} memory(ies)`);
+          const options = cas.expectedRevision === undefined ? undefined : { expectedRevision: cas.expectedRevision };
+          let confirmed: number;
+          let revision: number | undefined;
+          try {
+            const result = store.confirmVersioned(all ? "*" : toId(positionals[0]), undefined, options);
+            confirmed = result.confirmed;
+            revision = result.revision;
+          } catch (error) {
+            if (error instanceof MemoryMutationError) return reportMutationError(json, error);
+            throw error;
+          }
+          const result: Record<string, unknown> = { confirmed };
+          if (revision !== undefined) result.revision = revision;
+          out(json, result, `confirmed ${confirmed} memory(ies)${revision === undefined ? "" : ` (now rev ${revision})`}`);
           return 0;
+        }
+        case "forget": {
+          const id = toId(positionals[0]);
+          let result;
+          try {
+            result = store.forgetVersioned(id, undefined, cas.expectedRevision === undefined ? undefined : { expectedRevision: cas.expectedRevision });
+          } catch (error) {
+            if (error instanceof MemoryMutationError) return reportMutationError(json, error);
+            throw error;
+          }
+          const report: Record<string, unknown> = { deleted: result.deleted };
+          if (result.deletedRevision !== undefined) report.deletedRevision = result.deletedRevision;
+          out(json, report, result.deleted ? `forgot #${id} (was rev ${String(result.deletedRevision)})` : `no memory #${id}`);
+          return result.deleted ? 0 : 1;
         }
         case "export": {
           const records = store.list();
           const payload = JSON.stringify(
-            { format: "dsh-ltm-export/1", records },
+            { format: "dsh-ltm-export/2", records },
             null,
             2,
           );
@@ -483,10 +689,7 @@ export async function runCli(argv: readonly string[]): Promise<number> {
           return 0;
         }
         case "import": {
-          const file = positionals[0];
-          if (file === undefined) fail("import: missing <file>");
-          const records = parseImportPayload(JSON.parse(readFileSync(resolve(file), "utf8")));
-          const { imported, skipped } = store.importRecords(records);
+          const { imported, skipped } = store.importRecords(preparedImport!);
           out(json, { imported, skipped }, `imported ${imported}, skipped ${skipped}`);
           return 0;
         }

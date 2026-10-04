@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -95,9 +95,9 @@ describe("MemoryStore basics", () => {
   });
 
   it("rejects a future schema before PRAGMA or DDL can change its bytes", () => {
-    const path = versionedDb("2");
+    const path = versionedDb("3");
     const before = sha256(path);
-    expect(() => new MemoryStore(path)).toThrow(/newer than supported 1/);
+    expect(() => new MemoryStore(path)).toThrow(/newer than supported 2/);
     expect(sha256(path)).toBe(before);
 
     const db = new DatabaseSync(path, { readOnly: true });
@@ -120,7 +120,16 @@ describe("MemoryStore basics", () => {
   it("fails closed for an unsupported older schema", () => {
     const path = versionedDb("0");
     const before = sha256(path);
-    expect(() => new MemoryStore(path)).toThrow(/older than supported 1.*no migration path/);
+    expect(() => new MemoryStore(path)).toThrow(/older than supported 2.*no migration path/);
+    expect(sha256(path)).toBe(before);
+  });
+
+  it("refuses a v1 database read-only and points at the explicit upgrade path", () => {
+    const path = versionedDb("1");
+    const before = sha256(path);
+    expect(() => new MemoryStore(path)).toThrow(
+      /older than supported 2.*dsh-ltm upgrade-schema.*upgrade explicitly/s,
+    );
     expect(sha256(path)).toBe(before);
   });
 
@@ -128,16 +137,16 @@ describe("MemoryStore basics", () => {
     // The read-write preflight used to open the WAL database read-write, and the
     // close that follows the rejection checkpointed the WAL: main grew and
     // `-wal` disappeared even though the database was refused.
-    const path = uncheckpointedWalDb("2");
+    const path = uncheckpointedWalDb("3");
     const mainBefore = sha256(path);
     const walBefore = sha256(path + "-wal");
-    expect(() => new MemoryStore(path)).toThrow(/newer than supported 1/);
+    expect(() => new MemoryStore(path)).toThrow(/newer than supported 2/);
     expect(sha256(path)).toBe(mainBefore);
     expect(sha256(path + "-wal")).toBe(walBefore);
   });
 
   it("still adopts a valid WAL database through the read-only preflight", () => {
-    const path = uncheckpointedWalDb("1");
+    const path = uncheckpointedWalDb("2");
     const store = new MemoryStore(path);
     stores.push(store);
     expect(store.count()).toBe(0);
@@ -264,10 +273,11 @@ describe("cross-connection invariants", () => {
     const store = open();
     const record = { id: 42, text: "restored", tags: "a b", scope: "work", pinned: true, createdAt: 10, updatedAt: 20, lastConfirmedAt: 15 };
     expect(store.importRecords([record])).toEqual({ imported: 1, skipped: 0 });
-    expect(store.list()[0]).toEqual(record);
+    // A legacy-shape import (no revision) is restored at revision 1.
+    expect(store.list()[0]).toEqual({ ...record, revision: 1 });
     expect(store.importRecords([record])).toEqual({ imported: 0, skipped: 1 });
     expect(() => store.importRecords([{ ...record, text: "conflict" }])).toThrow(/conflicts/);
-    expect(store.list()[0]).toEqual(record);
+    expect(store.list()[0]).toEqual({ ...record, revision: 1 });
   });
 
   it("treats an existing record as identical regardless of property order", () => {
@@ -409,5 +419,118 @@ describe("merge (R4/R6)", () => {
   it("returns undefined for an unknown target", () => {
     const store = open();
     expect(store.merge({ targetId: 999, sourceIds: [] })).toBeUndefined();
+  });
+});
+
+describe("v2 preflight integrity (issue #32 repair round 2)", () => {
+  /** A v2-stamped database whose revision column lacks the CHECK guard, so
+   * rows can be corrupted the way an external writer would leave them.
+   * `extraSql` runs inside the WAL window; the benign default keeps the
+   * corruption-free shape used by the FTS-layout cases. */
+  function handcraftedV2(extraSql: string, inWal: boolean): string {
+    const dir = mkdtempSync(join(tmpdir(), "dsh-ltm-v2rows-"));
+    dirs.push(dir);
+    const path = join(dir, "ltm.db");
+    const base = `
+      CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE memories (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        text TEXT NOT NULL, tags TEXT NOT NULL DEFAULT '', scope TEXT NOT NULL DEFAULT '',
+        pinned INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, last_confirmed_at INTEGER NOT NULL,
+        revision INTEGER NOT NULL DEFAULT 1
+      );
+      INSERT INTO meta VALUES ('schema_version', '2');
+      INSERT INTO memories (text, tags, scope, pinned, created_at, updated_at, last_confirmed_at, revision) VALUES ('handcrafted fact', '', '', 0, 1, 2, 3, 1);
+    `;
+    const script = `
+      const { DatabaseSync } = require("node:sqlite");
+      const db = new DatabaseSync(process.argv[1]);
+      db.exec(${JSON.stringify(base)});
+      db.exec("PRAGMA journal_mode = WAL");
+      db.exec("PRAGMA wal_autocheckpoint = 0");
+      db.exec(${JSON.stringify(extraSql)});
+      process.kill(process.pid, "SIGKILL");
+    `;
+    const child = spawnSync(process.execPath, ["-e", script, path], { stdio: ["ignore", "ignore", "pipe"] });
+    if (child.signal !== "SIGKILL") {
+      throw new Error(`wal child failed: ${String(child.status)} ${String(child.stderr)}`);
+    }
+    return inWal ? path : checkpointed(path);
+  }
+
+  /** Fold the WAL back into the main file so corruption lives in main bytes. */
+  function checkpointed(path: string): string {
+    const db = new DatabaseSync(path);
+    db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    db.close();
+    return path;
+  }
+
+  it.each([
+    ["unindexed column in v2 fts", "CREATE VIRTUAL TABLE memories_fts USING fts5(text UNINDEXED, tags, scope, tokenize = 'unicode61')"],
+    ["foreign detail option in v2 fts", "CREATE VIRTUAL TABLE memories_fts USING fts5(text, tags, scope, tokenize = 'unicode61', detail='none')"],
+    ["comment-masked prefix option in v2 fts", "CREATE VIRTUAL TABLE memories_fts USING fts5(text, tags, scope, -- layout note\n tokenize = 'unicode61', prefix='2')"],
+  ])("refuses opening a v2 database with %s (main and WAL variants)", (_label, ftsSql) => {
+    for (const inWal of [false, true]) {
+      const path = handcraftedV2(ftsSql, inWal);
+      const mainBefore = sha256(path);
+      const walExisted = existsSync(path + "-wal");
+      const walBefore = walExisted ? sha256(path + "-wal") : undefined;
+      let message = "";
+      try {
+        const store = new MemoryStore(path);
+        stores.push(store);
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      expect(message).toMatch(/memories_fts/);
+      expect(sha256(path)).toBe(mainBefore);
+      if (walBefore !== undefined) expect(sha256(path + "-wal")).toBe(walBefore);
+    }
+  });
+
+  it("opens a v2 database whose fts uses legal quoting and comments", () => {
+    const path = handcraftedV2(
+      "CREATE VIRTUAL TABLE memories_fts -- object\n USING fts5(\"text\", [tags], scope, /* ok */ tokenize = 'unicode61')",
+      false,
+    );
+    const store = new MemoryStore(path);
+    stores.push(store);
+    expect(store.list()).toHaveLength(1);
+    expect(store.list()[0]!.revision).toBe(1);
+  });
+
+  it.each([
+    ["revision zero", "UPDATE memories SET revision = 0", true],
+    ["fractional revision", "UPDATE memories SET revision = 2.5", true],
+    ["revision above the safe range", "UPDATE memories SET revision = 9007199254740992", true],
+    ["pinned outside 0/1", "UPDATE memories SET pinned = 3", false],
+    ["text as a blob", "UPDATE memories SET text = x'00'", false],
+    ["negative timestamp", "UPDATE memories SET last_confirmed_at = -1", false],
+  ])("refuses opening a v2 database with %s without touching main/WAL", (_label, sql, inWal) => {
+    const path = handcraftedV2(sql, inWal);
+    const mainBefore = sha256(path);
+    // A checkpointed database may have no -wal file left at all; hash it
+    // whenever it exists and otherwise require it to stay absent.
+    const walExisted = existsSync(path + "-wal");
+    const walBefore = walExisted ? sha256(path + "-wal") : undefined;
+    let message = "";
+    try {
+      const store = new MemoryStore(path);
+      stores.push(store);
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).toMatch(/malformed memories row/);
+    expect(message).not.toContain("handcrafted");
+    expect(sha256(path)).toBe(mainBefore);
+    if (walBefore === undefined) {
+      // A read-only preflight may materialize an EMPTY -wal as SQLite
+      // shared-memory coordination (documented exception); nothing committed.
+      if (existsSync(path + "-wal")) expect(statSync(path + "-wal").size).toBe(0);
+    } else {
+      expect(sha256(path + "-wal")).toBe(walBefore);
+    }
   });
 });

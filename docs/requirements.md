@@ -25,6 +25,8 @@
 | R10 发布 | GitHub + npm | CI tag 门控发布（参照 dsh-quote-followup）；**push/publish 前需用户本人确认**；`main` 分支保护：只能经 PR 合并，必检 `test (22)`/`test (24)`/`pack` 全绿且分支最新，禁强推与删分支，管理员不豁免（见 `docs/integration.md` §1） |
 | R11 项目记忆隔离 | 随 agent cwd / Git 仓库自动切换 scope | Git 子目录与 linked worktree 得到相同 scope，非 Git cwd 独立；模型工具默认只读当前项目 + 全局、写当前项目、禁止跨 scope 修改/合并；`memory_list`/CLI 保留显式聚合（单测 + 真实 boot） |
 
+| R12 revision CAS（#32 阶段一） | 持久化 revision + opt-in 乐观并发 + 显式 v1→v2 升级 | 每条记录持久化正安全整数 revision（1..MAX_SAFE_INTEGER，DB CHECK 约束），读取/写入/搜索/提示行/dedupe 均携带；update/confirm/forget/merge 提供版本即在 `BEGIN IMMEDIATE` 事务内比较后写入，冲突输出结构化 `error:{code,operation,id,expectedRevision,currentRevision}` 且零写入；畸形版本输入拒绝不降级；merge 严格模式要求完整源声明；`confirm('*')` 拒绝版本字段；上限拒绝 `MEMORY_REVISION_OVERFLOW` 不静默溢出；v1 库默认只读拒绝，`dsh-ltm upgrade-schema` 先只读分类+`VACUUM INTO` 备份再同事务 ALTER+版本戳，拒绝路径主库/WAL 字节不变；export `/2` 带 revision、import 兼容 `/1`（缺省=1、提供则校验）；工具入参/输出 schema/序列化与注册值一致（单测+真实 boot probe）；文档声明 opt-in 限制与阶段二至四未完成 |
+
 ## 3. 工具集契约（§4 定稿）
 
 兼容保留（参数与返回形状对齐 dsh-memory@0.1.0，模型习惯不变）：

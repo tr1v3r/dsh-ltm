@@ -44,6 +44,22 @@ export interface MemoryRecord {
    * lastConfirmedAt is older than `staleAfterDays` are marked stale (R5).
    */
   lastConfirmedAt: number;
+  /**
+   * Optimistic-concurrency version (issue #32 phase 1), 1..MAX_SAFE_INTEGER,
+   * independent of any clock. Optional only for legacy in-memory records:
+   * every value read from the store or returned by a successful write carries
+   * a real revision. A missing revision never means "1" outside the explicit
+   * legacy import/migration boundaries.
+   */
+  revision?: number;
+}
+
+/**
+ * A record whose persisted revision is guaranteed present. What the store
+ * actually returns from every read and successful write path.
+ */
+export interface VersionedMemoryRecord extends MemoryRecord {
+  revision: number;
 }
 
 /** A search hit: the record plus engine scores. */
@@ -115,6 +131,44 @@ export interface MergeInput {
   tags?: readonly string[];
   /** Pinned flag of the result; defaults to target's. */
   pinned?: boolean;
+  /**
+   * CAS version of the target (issue #32 phase 1). Absent on BOTH this field
+   * and {@link expectedSourceRevisions} = legacy non-CAS merge. If either CAS
+   * field is present, this one is required and all sources must be declared.
+   */
+  expectedRevision?: number;
+  /**
+   * Complete set of source versions: exactly one entry per unique source id
+   * (after dropping `targetId` and duplicates from `sourceIds`), no extra or
+   * repeated ids. Required in strict (CAS) mode.
+   */
+  expectedSourceRevisions?: ReadonlyArray<{ id: number; revision: number }>;
+}
+
+/**
+ * CAS options for the mutating store operations (issue #32 phase 1). Absent
+ * or an explicitly-undefined field keeps the legacy, non-CAS behavior (which
+ * is NOT version-protected); a present-but-malformed value is rejected rather
+ * than downgraded to "not provided".
+ */
+export interface MutationOptions {
+  /** The revision the caller last observed for this record. */
+  expectedRevision?: number;
+}
+
+import type { MemoryMutationErrorCode, MemoryOperation } from "./errors.js";
+
+/**
+ * Structured tool failure detail. Same fields as the store's
+ * {@link MemoryMutationErrorDetail} but exact-optional-clean (no explicit
+ * `undefined` values), matching the registered output schema.
+ */
+export interface MemoryToolError {
+  code: MemoryMutationErrorCode;
+  operation: MemoryOperation;
+  id?: number;
+  expectedRevision?: number;
+  currentRevision?: number;
 }
 
 /**
@@ -150,13 +204,33 @@ export interface MemoryStore {
     id: number,
     patch: { text?: string; tags?: readonly string[]; pinned?: boolean },
     scopes?: readonly ScopeName[],
+    options?: MutationOptions,
   ): MemoryRecord | undefined;
   /** Refresh lastConfirmedAt for one/all records, optionally scope-filtered. */
-  confirm(id: number | "*", scopes?: readonly ScopeName[]): number;
+  confirm(id: number | "*", scopes?: readonly ScopeName[], options?: MutationOptions): number;
+  /**
+   * Confirm with the post-write revision attached (`id: "*"` never reports a
+   * single pseudo-revision). Failure semantics match {@link confirm}.
+   */
+  confirmVersioned(
+    id: number | "*",
+    scopes?: readonly ScopeName[],
+    options?: MutationOptions,
+  ): { confirmed: number; revision?: number };
   /** Merge duplicates, optionally constrained to allowed scopes. */
   merge(input: MergeInput, scopes?: readonly ScopeName[]): MemoryRecord | undefined;
   /** Delete one memory, optionally constrained to allowed scopes. */
-  forget(id: number, scopes?: readonly ScopeName[]): boolean;
+  forget(id: number, scopes?: readonly ScopeName[], options?: MutationOptions): boolean;
+  /**
+   * Delete with the deleted revision attached (`deletedRevision` is the
+   * version that was removed, never a post-delete value). Failure semantics
+   * match {@link forget}.
+   */
+  forgetVersioned(
+    id: number,
+    scopes?: readonly ScopeName[],
+    options?: MutationOptions,
+  ): { deleted: boolean; deletedRevision?: number };
   /** Total stored memories. */
   count(): number;
   /** Close the connection; idempotent. */
@@ -276,17 +350,27 @@ export interface ToolSet {
   }): { record: MemoryRecord; dedupeHits: DedupeHit[] } & BudgetFeedback;
   /** Legacy-compatible; ranked results. */
   memory_search(args: { query: string; limit?: number }): { results: SearchResult[] };
-  /** Legacy-compatible delete. */
-  memory_forget(args: { id: number }): { deleted: boolean };
-  /** Revise text/tags/pinned in place. */
+  /** Legacy-compatible delete; phase 1 adds opt-in CAS. */
+  memory_forget(args: {
+    id: number;
+    expectedRevision?: number;
+  }): { deleted: boolean; deletedRevision?: number; error?: MemoryToolError };
+  /** Revise text/tags/pinned in place; phase 1 adds opt-in CAS. */
   memory_update(args: {
     id: number;
     text?: string;
     tags?: string[];
     pinned?: boolean;
-  }): { record: MemoryRecord | undefined } & BudgetFeedback;
-  /** Refresh lastConfirmedAt, clear stale; `id: "*"` refreshes all. */
-  memory_confirm(args: { id: number | "*" }): { confirmed: number };
+    expectedRevision?: number;
+  }): { record: MemoryRecord | undefined; revision?: number; error?: MemoryToolError } & BudgetFeedback;
+  /**
+   * Refresh lastConfirmedAt, clear stale; `id: "*"` refreshes all. Phase 1
+   * adds opt-in CAS for a single id; `*` never accepts a revision.
+   */
+  memory_confirm(args: {
+    id: number | "*";
+    expectedRevision?: number;
+  }): { confirmed: number; revision?: number; error?: MemoryToolError };
   /** Browse by scope/tag/stale/pinned. */
   memory_list(args: {
     scope?: string;
@@ -294,11 +378,13 @@ export interface ToolSet {
     stale?: boolean;
     limit?: number;
   }): { records: MemoryRecord[] };
-  /** Merge duplicates into a surviving record. */
+  /** Merge duplicates into a surviving record; phase 1 adds opt-in CAS. */
   memory_merge(args: {
     targetId: number;
     sourceIds: number[];
     text?: string;
     tags?: string[];
-  }): { record: MemoryRecord | undefined };
+    expectedRevision?: number;
+    expectedSourceRevisions?: Array<{ id: number; revision: number }>;
+  }): { record: MemoryRecord | undefined; revision?: number; error?: MemoryToolError };
 }
