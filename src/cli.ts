@@ -171,6 +171,9 @@ function parseArgv(argv: readonly string[]): ParsedArgs {
         if (flag === "help") continue;
         if (!allowedBools.has(flag)) fail(`${parsed.command}: unknown flag --${flag}`);
       }
+      // Help is informational: do not require operation arguments or validate
+      // their combinations. Keep option spelling/value syntax checks above.
+      if (parsed.boolFlags.has("help")) return parsed;
       if (parsed.positionals.length < spec.min) fail(`${parsed.command}: missing argument`);
       if (spec.max !== undefined && parsed.positionals.length > spec.max) {
         fail(`${parsed.command}: unexpected argument ${JSON.stringify(parsed.positionals[spec.max])}`);
