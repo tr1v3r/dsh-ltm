@@ -395,6 +395,11 @@ export class MemoryStore implements MemoryStoreContract {
         : [...new Set(typeof scope === "string" ? [scope] : scope)];
     if (scopes?.length === 0) return [];
     const capped = Math.max(1, Math.min(limit, this.#options.searchLimitMax));
+    // A fixed pool keeps BM25 min-max normalization and ranking independent of
+    // the requested output limit. The 200-candidate floor trades bounded cosine
+    // work for recall quality; this is not an exact full-database rerank. Honor
+    // larger configured output caps without ever fetching an unbounded pool.
+    const candidateLimit = Math.max(200, this.#options.searchLimitMax);
     const scopeClause =
       scopes === undefined
         ? ""
@@ -404,17 +409,17 @@ export class MemoryStore implements MemoryStoreContract {
       FROM memories_fts JOIN memories m ON m.id = memories_fts.rowid
       WHERE memories_fts MATCH ?
       ${scopeClause}
-      ORDER BY memories_fts.rank
+      ORDER BY memories_fts.rank, m.id
       LIMIT ?
     `;
-    const params: (string | number)[] = [match, ...(scopes ?? []), capped];
+    const params: (string | number)[] = [match, ...(scopes ?? []), candidateLimit];
     const rows = this.#db.prepare(sql).all(...params) as Row[];
     const hits: SearchResult[] = rows.map((row) => ({
       ...toRecord(row),
       ftsRank: (row.fts_rank as number) ?? 0,
       score: 0,
     }));
-    return rerankResults(query, hits);
+    return rerankResults(query, hits).slice(0, capped);
   }
 
   list(filter?: ListFilter): MemoryRecord[] {
