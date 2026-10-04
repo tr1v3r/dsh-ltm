@@ -204,14 +204,20 @@ dsh-ltm --db /path/to/ltm.db upgrade-schema            # backup beside the db by
 dsh-ltm --db /path/to/ltm.db upgrade-schema --backup /path/to/new-backup.db
 ```
 
-The command classifies the database on a read-only connection (unknown,
-malformed, fake-v1, and newer schemas are refused with the main database and
-committed WAL bytes untouched), takes one SQLite-consistent backup via
-read-only `VACUUM INTO` (default name `<db>.pre-v2-backup-<UTC timestamp>`,
-never overwriting an existing file or targeting the database/sidecars), and
-applies `ALTER TABLE memories ADD COLUMN revision …` plus the
+The command classifies the database on a read-only connection — unknown,
+malformed, fake-v1, and newer schemas, a malformed/foreign `memories_fts`
+object, or invalid base rows (checked read-only, including rows that only
+exist in committed WAL frames) are all refused with the main database and
+committed WAL bytes untouched and no backup taken. It then takes one
+SQLite-consistent backup via read-only `VACUUM INTO` (default name
+`<db>.pre-v2-backup-<UTC timestamp>`, never overwriting an existing file or
+targeting the database/sidecars), and applies
+`ALTER TABLE memories ADD COLUMN revision …` plus the
 `meta.schema_version = '2'` stamp in a single transaction after re-verifying
-the v1 structure under the write lock. Old rows keep their text, timestamps,
+the v1 structure, FTS shape, and row integrity under the write lock. If a
+concurrent upgrade won that race, this run makes no changes but still
+**reports the backup it already took** (kept and announced — never silently
+deleted — because it may contain private content; delete it after review). Old rows keep their text, timestamps,
 scope, tags, and pinned state, and start at revision 1; `fts_token_version` is
 untouched. A failure rolls back with no half-upgraded state and keeps the
 backup. Rollback is manual: stop writers and restore the backup snapshot

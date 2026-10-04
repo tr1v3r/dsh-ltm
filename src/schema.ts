@@ -95,6 +95,73 @@ function tableColumns(db: DatabaseSync, table: string): TableColumn[] | undefine
   return db.prepare(`PRAGMA table_info(${table})`).all() as unknown as TableColumn[];
 }
 
+/** Upper bound shared by the safe-integer row checks (Number.MAX_SAFE_INTEGER). */
+const SAFE_INTEGER_MAX = 9007199254740991;
+
+/**
+ * Read-only shape check for an existing `memories_fts` object, shared by the
+ * v1 classification, the under-lock re-verification, and the current-v2
+ * preflight. A MISSING derived object is fine (idempotently rebuildable);
+ * one that EXISTS must be the exact FTS5 layout this package writes: a real
+ * fts5 virtual table over the three expected columns, the agreed
+ * `unicode61` tokenizer, and self-owned content (no external-content or
+ * contentless `content=` mode). Foreign or malformed objects are refused,
+ * never silently rebuilt over.
+ */
+export function assertFtsShape(db: DatabaseSync): void {
+  const row = db
+    .prepare("SELECT type, sql FROM sqlite_schema WHERE name = 'memories_fts'")
+    .get() as { type: string; sql: string | null } | undefined;
+  if (row === undefined) return;
+  const sql = (row.sql ?? "").replace(/\s+/g, " ").trim();
+  const columns = db.prepare("PRAGMA table_info(memories_fts)").all() as unknown as TableColumn[];
+  const names = columns.map((column) => column.name).join(",");
+  if (
+    row.type !== "table" ||
+    !/USING\s+fts5\s*\(/i.test(sql) ||
+    names !== "text,tags,scope" ||
+    !/tokenize\s*=\s*'unicode61'/i.test(sql) ||
+    // External-content/contentless FTS is a foreign derivation mode: our
+    // index stores the token stream itself and must stay rebuildable.
+    /\bcontent\s*=/i.test(sql)
+  ) {
+    throw new Error(
+      "dsh-ltm: existing database has an unexpected memories_fts object (expected the fts5 text/tags/scope unicode61 self-content index); refusing to reuse or rebuild over it",
+    );
+  }
+}
+
+/**
+ * Read-only integrity scan of the `memories` base rows, shared by the v1
+ * classification, the under-lock re-verification, and the current-v2
+ * preflight: ids are positive safe integers, text/tags/scope are text,
+ * pinned is 0/1, lifecycle timestamps are non-negative safe integers, and
+ * (`withRevision`) revision is a positive safe integer. The error is
+ * metadata-only — never stored values or prose. Deliberately no
+ * provenance/audit columns and no cross-column time relationships.
+ */
+export function assertMemoriesRowsHealthy(db: DatabaseSync, withRevision: boolean): void {
+  const revisionClause = withRevision
+    ? " OR typeof(revision) != 'integer' OR revision < 1 OR revision > 9007199254740991"
+    : "";
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM memories WHERE
+         typeof(id) != 'integer' OR id < 1 OR id > ${SAFE_INTEGER_MAX}
+         OR typeof(text) != 'text' OR typeof(tags) != 'text' OR typeof(scope) != 'text'
+         OR typeof(pinned) != 'integer' OR pinned NOT IN (0, 1)
+         OR typeof(created_at) != 'integer' OR created_at < 0 OR created_at > ${SAFE_INTEGER_MAX}
+         OR typeof(updated_at) != 'integer' OR updated_at < 0 OR updated_at > ${SAFE_INTEGER_MAX}
+         OR typeof(last_confirmed_at) != 'integer' OR last_confirmed_at < 0 OR last_confirmed_at > ${SAFE_INTEGER_MAX}${revisionClause}`,
+    )
+    .get() as { n: number };
+  if (row.n > 0) {
+    throw new Error(
+      `dsh-ltm: existing database contains ${row.n} malformed memories row(s); refusing to read or modify an unknown state`,
+    );
+  }
+}
+
 /**
  * Structural check of a `memories` base table against an expected column set.
  * `revision` additionally requires the v2 default `1` when `requireRevision`.
@@ -218,17 +285,11 @@ export function assertSchemaCompatible(db: DatabaseSync): void {
         "dsh-ltm: existing database has an unrecognized `memories` table for schema version 2; refusing to modify an unknown schema",
       );
     }
-    const corrupted = db
-      .prepare(
-        "SELECT COUNT(*) AS n FROM memories WHERE typeof(revision) != 'integer' OR revision < 1 OR revision > 9007199254740991",
-      )
-      .get() as { n: number };
-    if (corrupted.n > 0) {
-      throw new Error(
-        "dsh-ltm: existing database contains rows with invalid revision values; refusing to read them as a default",
-      );
-    }
+    assertMemoriesRowsHealthy(db, true);
   }
+  // A present FTS shadow must be the expected derived object; a missing one
+  // is rebuilt idempotently by `ensureSchema` + the token-version repair.
+  assertFtsShape(db);
 }
 
 /**
@@ -271,15 +332,16 @@ export function classifyForUpgrade(db: DatabaseSync): SchemaUpgradeClassificatio
         "dsh-ltm: v1 database does not match the expected legacy memories table (unexpected columns or types); refusing to upgrade",
     };
   }
-  // A v1 database with a `memories_fts` shadow must have the FTS5 virtual
-  // table shape we know; a foreign FTS definition is not silently rebuilt.
-  const fts = db
-    .prepare("SELECT type, sql FROM sqlite_schema WHERE name = 'memories_fts'")
-    .get() as { type: string; sql: string } | undefined;
-  if (fts !== undefined && (fts.type !== "table" || !/USING\s+fts5/i.test(fts.sql ?? ""))) {
+  // A v1 database with a `memories_fts` shadow must have the exact FTS5
+  // layout we know (columns, tokenizer, self-owned content); a foreign or
+  // malformed FTS object is refused, never silently rebuilt over.
+  try {
+    assertFtsShape(db);
+    assertMemoriesRowsHealthy(db, false);
+  } catch (error) {
     return {
       kind: "unsupported",
-      reason: "dsh-ltm: v1 database has an unexpected memories_fts object; refusing to upgrade",
+      reason: error instanceof Error ? error.message : String(error),
     };
   }
   return { kind: "legacy-v1" };
@@ -287,9 +349,11 @@ export function classifyForUpgrade(db: DatabaseSync): SchemaUpgradeClassificatio
 
 /**
  * Verify, on a connection that has already acquired the write lock, that the
- * database still holds the claimed version and v1 structure. Used by the
- * upgrade path: the unlocked read-only preflight must never be the only
- * check (another writer may have committed in between).
+ * database still holds the claimed version and v1 structure — including the
+ * FTS shape and base-row integrity, reusing the read-only checks from the
+ * classification. Used by the upgrade path: the unlocked read-only preflight
+ * must never be the only check (another writer may have committed in
+ * between).
  */
 export function assertUpgradeableV1(db: DatabaseSync): void {
   const row = db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as
@@ -307,6 +371,8 @@ export function assertUpgradeableV1(db: DatabaseSync): void {
       "dsh-ltm: v1 database structure changed while the upgrade was starting; no changes were made",
     );
   }
+  assertFtsShape(db);
+  assertMemoriesRowsHealthy(db, false);
 }
 
 /**

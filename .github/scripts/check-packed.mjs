@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const ENTRY_FILES = ["cli.d.ts", "cli.js", "index.d.ts", "index.js"];
-const ROOT_FILES = ["LICENSE", "README.md", "bin/dsh-ltm.mjs", "cordis.patch.yml", "package.json"];
+const ROOT_FILES = ["LICENSE", "README.md", "README.zh.md", "bin/dsh-ltm.mjs", "cordis.patch.yml", "package.json"];
 const HASHED_CHUNK = /^[A-Za-z0-9_-]+-[A-Za-z0-9_-]{8,}\.js$/;
 
 /** Compare every packed file with fixed public files and this build's chunks. */

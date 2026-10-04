@@ -27,6 +27,7 @@ import { DatabaseSync } from "node:sqlite";
 
 import { outputConflictsWithDatabase } from "./output-path.js";
 import {
+  assertSchemaCompatible,
   assertUpgradeableV1,
   classifyForUpgrade,
   REVISION_COLUMN_DDL,
@@ -49,10 +50,19 @@ export interface UpgradeSchemaReport {
   upgraded: boolean;
   /** Schema version after the run (always the current version). */
   schemaVersion: number;
-  /** The backup file written before mutating the database (v1 runs only). */
+  /**
+   * The backup file this run wrote before mutating the database. Present for
+   * every run that took a backup — including the concurrent-upgrade no-op,
+   * where the snapshot may contain private content and is therefore kept and
+   * reported (never silently deleted) for the operator to review and remove.
+   * `undefined` only when no backup was taken (already current at the
+   * read-only classification).
+   */
   backupPath?: string;
-  /** Rows present when the transition ran (v1); `0` for already-current runs. */
+  /** Rows present when the transition ran (v1); `0` for no-op runs. */
   recordCount: number;
+  /** Why a no-op run still reports a backup (concurrent-upgrade race only). */
+  note?: string;
 }
 
 function defaultBackupPath(dbPath: string): string {
@@ -140,13 +150,24 @@ export function upgradeSchema(path: string, options?: UpgradeSchemaOptions): Upg
     try {
       // Re-verify under the write lock: the unlocked preflight must not be
       // the only check. A concurrent upgrade that already committed leaves
-      // the database current — report that instead of failing.
+      // the database current — verify the FULL current structure (never
+      // trust the version stamp alone) and report a no-op.
       const version = db
         .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
         .get() as { value: string } | undefined;
       if (version?.value === String(SCHEMA_VERSION)) {
+        assertSchemaCompatible(db);
         db.exec("ROLLBACK");
-        return { upgraded: false, schemaVersion: SCHEMA_VERSION, recordCount: 0 };
+        // This run already wrote its backup before acquiring the lock. The
+        // snapshot may contain private content, so it is kept and REPORTED
+        // rather than silently deleted; the operator deletes it after review.
+        return {
+          upgraded: false,
+          schemaVersion: SCHEMA_VERSION,
+          recordCount: 0,
+          backupPath: backup,
+          note: "a concurrent upgrade had already committed; this run made no changes and its pre-taken backup was kept (delete it after review if unneeded)",
+        };
       }
       assertUpgradeableV1(db);
       db.exec(`ALTER TABLE memories ADD COLUMN ${REVISION_COLUMN_DDL}`);
@@ -161,7 +182,11 @@ export function upgradeSchema(path: string, options?: UpgradeSchemaOptions): Upg
         // The transaction may already have been rolled back; the original
         // error is the one that matters. The backup stays on disk.
       }
-      throw error;
+      // Never leave an unreported sensitive snapshot behind: surface where
+      // the kept backup is alongside the original failure.
+      throw new Error(
+        `${error instanceof Error ? error.message : String(error)}; backup kept at ${backup}`,
+      );
     }
   } finally {
     db.close();

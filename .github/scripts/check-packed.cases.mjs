@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { assertPackedContents } from "./check-packed.mjs";
 
 const entries = ["cli.d.ts", "cli.js", "index.d.ts", "index.js"];
-const roots = ["LICENSE", "README.md", "bin/dsh-ltm.mjs", "cordis.patch.yml", "package.json"];
+const roots = ["LICENSE", "README.md", "README.zh.md", "bin/dsh-ltm.mjs", "cordis.patch.yml", "package.json"];
 const packed = (built) => [...roots, ...built.map((file) => `dist/${file}`)];
 
 test("accepts renamed and multiple shared chunks from the actual build", () => {

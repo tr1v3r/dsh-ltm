@@ -91,6 +91,27 @@ function v1Database(): string {
   return path;
 }
 
+/** Run `preWal` then WAL-only `postWal` SQL and SIGKILL: committed frames stay in -wal. */
+function uncheckpointedDatabase(preWal: string, postWal: string): string {
+  const root = dir();
+  const path = join(root, "ltm.db");
+  const script = `
+    const { DatabaseSync } = require("node:sqlite");
+    const db = new DatabaseSync(process.argv[1]);
+    db.exec(${JSON.stringify(preWal)});
+    db.exec("PRAGMA journal_mode = WAL");
+    db.exec("PRAGMA wal_autocheckpoint = 0");
+    db.exec(${JSON.stringify(postWal)});
+    process.kill(process.pid, "SIGKILL");
+  `;
+  const child = spawnSync(process.execPath, ["-e", script, path], { stdio: ["ignore", "ignore", "pipe"] });
+  if (child.signal !== "SIGKILL") {
+    throw new Error(`wal child failed: ${String(child.status)} ${String(child.stderr)}`);
+  }
+  expect(existsSync(path + "-wal")).toBe(true);
+  return path;
+}
+
 /** A v1 database whose committed WAL frames only exist in the -wal file. */
 function uncheckpointedV1Database(): string {
   const root = dir();
@@ -313,9 +334,15 @@ describe("upgradeSchema v1 → v2", () => {
     });
     // Explicit backup path: the nested racer takes the default name in the
     // same second, and defaults never overwrite an existing file.
-    const report = upgradeSchema(path, { backupPath: join(dir(), "outer.bak") });
+    const outerBackup = join(dir(), "outer.bak");
+    const report = upgradeSchema(path, { backupPath: outerBackup });
     expect(interleaved).toBe(true);
     expect(report.upgraded).toBe(false);
+    // The no-op race branch keeps and REPORTS this run's backup instead of
+    // leaving an unannounced sensitive snapshot behind.
+    expect(report.backupPath).toBe(outerBackup);
+    expect(existsSync(outerBackup)).toBe(true);
+    expect(report.note).toContain("concurrent upgrade");
     const db = new DatabaseSync(path, { readOnly: true });
     expect(db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get())
       .toEqual({ value: "2" });
@@ -336,5 +363,100 @@ describe("upgradeSchema v1 → v2", () => {
       return exec.call(this, sql);
     });
     expect(() => upgradeSchema(path)).toThrow(/changed while the upgrade was starting|unexpected columns/);
+  });
+});
+
+describe("preflight integrity: FTS shape and base rows (repair round 2)", () => {
+  const MALFORMED_FTS: Array<[string, string]> = [
+    ["plain table shadow", "CREATE TABLE memories_fts (a TEXT)"],
+    ["fts5 with a foreign tokenizer", "CREATE VIRTUAL TABLE memories_fts USING fts5(text, tags, scope, tokenize = 'porter')"],
+    ["external-content fts5", "CREATE VIRTUAL TABLE memories_fts USING fts5(text, tags, scope, content='memories', content_rowid='id')"],
+    ["fts5 with wrong columns", "CREATE VIRTUAL TABLE memories_fts USING fts5(text, tags)"],
+  ];
+
+  /**
+   * A seeded v1 database plus one extra statement, optionally committed into
+   * -wal only. `replaceFts` drops the stock FTS table so the extra statement
+   * can install a malformed replacement instead of colliding with it.
+   */
+  function v1With(statement: string, inWal: boolean, replaceFts = false): string {
+    const ddl = replaceFts ? V1_DDL.replace(/CREATE VIRTUAL TABLE[^;]*;/, "") : V1_DDL;
+    const seed = "INSERT INTO memories (text, tags, scope, pinned, created_at, updated_at, last_confirmed_at) VALUES ('v1 global fact', 'legacy', '', 1, 100, 200, 150)";
+    const preWal = `${ddl};${seed};${inWal ? "" : statement}`;
+    const postWal = inWal ? statement : "CREATE TABLE IF NOT EXISTS filler (a TEXT)";
+    return uncheckpointedDatabase(preWal, postWal);
+  }
+
+  it.each(MALFORMED_FTS.map(([label]) => label))(
+    "refuses a v1 database with %s before any rw handle, backup, or ALTER",
+    (label) => {
+      const [_, statement] = MALFORMED_FTS.find(([l]) => l === label)!;
+      for (const inWal of [false, true]) {
+        const path = v1With(statement, inWal, true);
+        const mainBefore = sha256(path);
+        const walBefore = sha256(path + "-wal");
+        const backup = join(dir(), `refused-${inWal ? "wal" : "main"}.bak`);
+        expect(() => upgradeSchema(path, { backupPath: backup })).toThrow(/memories_fts/);
+        // Refusal happened read-only: no backup, no revision column, and the
+        // main + committed WAL bytes are untouched.
+        expect(existsSync(backup)).toBe(false);
+        expect(sha256(path)).toBe(mainBefore);
+        expect(sha256(path + "-wal")).toBe(walBefore);
+        const probe = new DatabaseSync(path, { readOnly: true });
+        expect(probe.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get())
+          .toEqual({ value: "1" });
+        const columns = probe.prepare("PRAGMA table_info(memories)").all() as unknown as Array<{ name: string }>;
+        expect(columns.some((column) => column.name === "revision")).toBe(false);
+        probe.close();
+      }
+    },
+  );
+
+  const BAD_ROWS: Array<[string, string]> = [
+    ["id zero", "INSERT INTO memories (id, text, tags, scope, pinned, created_at, updated_at, last_confirmed_at) VALUES (0, 'x', '', '', 0, 1, 1, 1)"],
+    ["id above the safe range", "INSERT INTO memories (id, text, tags, scope, pinned, created_at, updated_at, last_confirmed_at) VALUES (9007199254740992, 'x', '', '', 0, 1, 1, 1)"],
+    ["text stored as a blob", "UPDATE memories SET text = x'00' WHERE id = 1"],
+    ["tags stored as a blob", "UPDATE memories SET tags = x'00' WHERE id = 1"],
+    ["scope stored as a blob", "UPDATE memories SET scope = x'00' WHERE id = 1"],
+    ["pinned outside 0/1", "UPDATE memories SET pinned = 2 WHERE id = 1"],
+    ["negative created_at", "UPDATE memories SET created_at = -1 WHERE id = 1"],
+    ["fractional updated_at", "UPDATE memories SET updated_at = 1.5 WHERE id = 1"],
+    ["last_confirmed_at above the safe range", "UPDATE memories SET last_confirmed_at = 9007199254740992 WHERE id = 1"],
+  ];
+
+  it.each(BAD_ROWS.map(([label]) => label))(
+    "refuses a v1 database with a %s row and never upgrades or backs it up",
+    (label) => {
+      const [_, statement] = BAD_ROWS.find(([l]) => l === label)!;
+      for (const inWal of [false, true]) {
+        const path = v1With(statement, inWal);
+        const mainBefore = sha256(path);
+        const walBefore = sha256(path + "-wal");
+        const backup = join(dir(), `refused-row-${inWal ? "wal" : "main"}.bak`);
+        let message = "";
+        try {
+          upgradeSchema(path, { backupPath: backup });
+        } catch (error) {
+          message = error instanceof Error ? error.message : String(error);
+        }
+        expect(message).toMatch(/malformed memories row/);
+        // Metadata-only: no stored prose or raw values in the error.
+        expect(message).not.toContain("v1 global fact");
+        expect(existsSync(backup)).toBe(false);
+        expect(sha256(path)).toBe(mainBefore);
+        expect(sha256(path + "-wal")).toBe(walBefore);
+        const probe = new DatabaseSync(path, { readOnly: true });
+        expect(probe.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get())
+          .toEqual({ value: "1" });
+        probe.close();
+      }
+    },
+  );
+
+  it("a v1 database whose FTS and rows are healthy still upgrades through the WAL path", () => {
+    const path = uncheckpointedV1Database();
+    const report = upgradeSchema(path);
+    expect(report.upgraded).toBe(true);
+    expect(report.recordCount).toBe(2);
   });
 });

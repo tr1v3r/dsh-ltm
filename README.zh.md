@@ -176,11 +176,14 @@ dsh-ltm --db /path/to/ltm.db upgrade-schema            # 默认在库旁生成�
 dsh-ltm --db /path/to/ltm.db upgrade-schema --backup /path/to/new-backup.db
 ```
 
-该命令先在只读连接上分类（未知、畸形、伪造 v1、较新版本一律拒绝，主库与已提交 WAL 字节
-不变），再用只读 `VACUUM INTO` 取一份 SQLite 一致的备份（默认名
+该命令先在只读连接上分类（未知、畸形、伪造 v1、较新版本、畸形/外来 `memories_fts`
+对象、非法基础行——含仅存在于已提交 WAL 帧中的——一律拒绝，主库与已提交 WAL 字节不变、
+不建备份），再用只读 `VACUUM INTO` 取一份 SQLite 一致的备份（默认名
 `<db>.pre-v2-backup-<UTC时间戳>`，绝不覆盖既有文件、绝不指向数据库/sidecar），最后在
-写锁下重新核验 v1 结构后，于同一事务应用 `ALTER TABLE memories ADD COLUMN revision …`
-与 `meta.schema_version = '2'` 版本戳。旧行保持正文/时间戳/scope/tags/pinned 并从
+写锁下重新核验 v1 结构、FTS 形状与行完整性后，于同一事务应用
+`ALTER TABLE memories ADD COLUMN revision …` 与 `meta.schema_version = '2'` 版本戳。
+若并发升级赢得了该竞态，本次运行不改动任何内容，但会**报告自己已取得的备份**
+（保留并明示、绝不静默删除——快照可能含私密正文，审阅后自行删除）。旧行保持正文/时间戳/scope/tags/pinned 并从
 revision 1 开始；`fts_token_version` 不动。失败即回滚、无半升级状态、备份保留。回滚需
 手工进行：停掉写入者并恢复备份快照（升级后的写入会丢失）。已升级库是 metadata-only
 no-op；该命令绝不创建缺失或空数据库。旧的 `dsh-memory` → dsh-ltm 一次性迁移是独立的

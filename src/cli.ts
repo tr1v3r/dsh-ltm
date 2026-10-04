@@ -445,7 +445,9 @@ export async function runCli(argv: readonly string[]): Promise<number> {
         report,
         report.upgraded
           ? `upgraded ${config.path} to schema v${report.schemaVersion} (${report.recordCount} records); backup at ${report.backupPath}`
-          : `${config.path} is already at schema v${report.schemaVersion}; nothing to do`,
+          : report.backupPath === undefined
+            ? `${config.path} is already at schema v${report.schemaVersion}; nothing to do`
+            : `${config.path} is already at schema v${report.schemaVersion}; nothing to do — this run still kept its pre-taken backup at ${report.backupPath} (delete it after review if unneeded)`,
       );
       return 0;
     }
@@ -461,6 +463,29 @@ export async function runCli(argv: readonly string[]): Promise<number> {
       };
       out(json, report, JSON.stringify(report, null, 2));
       return 0;
+    }
+
+    // `import` validates its whole payload (file, JSON, record shape,
+    // revisions) before the store is opened: an invalid input must not even
+    // create the target database or its parent directory. The validated
+    // records are reused for the atomic import below.
+    let preparedImport: MemoryRecord[] | undefined;
+    if (command === "import") {
+      const file = positionals[0];
+      if (file === undefined) fail("import: missing <file>");
+      let raw: string;
+      try {
+        raw = readFileSync(resolve(file), "utf8");
+      } catch {
+        fail(`import: cannot read ${JSON.stringify(file)}`);
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        fail("import: file is not valid JSON");
+      }
+      preparedImport = parseImportPayload(parsed);
     }
 
     const store = openStore(config);
@@ -664,10 +689,7 @@ export async function runCli(argv: readonly string[]): Promise<number> {
           return 0;
         }
         case "import": {
-          const file = positionals[0];
-          if (file === undefined) fail("import: missing <file>");
-          const records = parseImportPayload(JSON.parse(readFileSync(resolve(file), "utf8")));
-          const { imported, skipped } = store.importRecords(records);
+          const { imported, skipped } = store.importRecords(preparedImport!);
           out(json, { imported, skipped }, `imported ${imported}, skipped ${skipped}`);
           return 0;
         }

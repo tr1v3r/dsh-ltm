@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -419,5 +419,82 @@ describe("merge (R4/R6)", () => {
   it("returns undefined for an unknown target", () => {
     const store = open();
     expect(store.merge({ targetId: 999, sourceIds: [] })).toBeUndefined();
+  });
+});
+
+describe("v2 preflight integrity (issue #32 repair round 2)", () => {
+  /** A v2-stamped database whose revision column lacks the CHECK guard, so
+   * rows can be corrupted the way an external writer would leave them. */
+  function handcraftedV2(rowSql: string, inWal: boolean): string {
+    const dir = mkdtempSync(join(tmpdir(), "dsh-ltm-v2rows-"));
+    dirs.push(dir);
+    const path = join(dir, "ltm.db");
+    const base = `
+      CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE memories (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        text TEXT NOT NULL, tags TEXT NOT NULL DEFAULT '', scope TEXT NOT NULL DEFAULT '',
+        pinned INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, last_confirmed_at INTEGER NOT NULL,
+        revision INTEGER NOT NULL DEFAULT 1
+      );
+      INSERT INTO meta VALUES ('schema_version', '2');
+      INSERT INTO memories (text, tags, scope, pinned, created_at, updated_at, last_confirmed_at, revision) VALUES ('handcrafted fact', '', '', 0, 1, 2, 3, 1);
+    `;
+    const script = `
+      const { DatabaseSync } = require("node:sqlite");
+      const db = new DatabaseSync(process.argv[1]);
+      db.exec(${JSON.stringify(base)});
+      db.exec("PRAGMA journal_mode = WAL");
+      db.exec("PRAGMA wal_autocheckpoint = 0");
+      db.exec(${JSON.stringify(rowSql)});
+      process.kill(process.pid, "SIGKILL");
+    `;
+    const child = spawnSync(process.execPath, ["-e", script, path], { stdio: ["ignore", "ignore", "pipe"] });
+    if (child.signal !== "SIGKILL") {
+      throw new Error(`wal child failed: ${String(child.status)} ${String(child.stderr)}`);
+    }
+    return inWal ? path : checkpointed(path);
+  }
+
+  /** Fold the WAL back into the main file so corruption lives in main bytes. */
+  function checkpointed(path: string): string {
+    const db = new DatabaseSync(path);
+    db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    db.close();
+    return path;
+  }
+
+  it.each([
+    ["revision zero", "UPDATE memories SET revision = 0", true],
+    ["fractional revision", "UPDATE memories SET revision = 2.5", true],
+    ["revision above the safe range", "UPDATE memories SET revision = 9007199254740992", true],
+    ["pinned outside 0/1", "UPDATE memories SET pinned = 3", false],
+    ["text as a blob", "UPDATE memories SET text = x'00'", false],
+    ["negative timestamp", "UPDATE memories SET last_confirmed_at = -1", false],
+  ])("refuses opening a v2 database with %s without touching main/WAL", (_label, sql, inWal) => {
+    const path = handcraftedV2(sql, inWal);
+    const mainBefore = sha256(path);
+    // A checkpointed database may have no -wal file left at all; hash it
+    // whenever it exists and otherwise require it to stay absent.
+    const walExisted = existsSync(path + "-wal");
+    const walBefore = walExisted ? sha256(path + "-wal") : undefined;
+    let message = "";
+    try {
+      const store = new MemoryStore(path);
+      stores.push(store);
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).toMatch(/malformed memories row/);
+    expect(message).not.toContain("handcrafted");
+    expect(sha256(path)).toBe(mainBefore);
+    if (walBefore === undefined) {
+      // A read-only preflight may materialize an EMPTY -wal as SQLite
+      // shared-memory coordination (documented exception); nothing committed.
+      if (existsSync(path + "-wal")) expect(statSync(path + "-wal").size).toBe(0);
+    } else {
+      expect(sha256(path + "-wal")).toBe(walBefore);
+    }
   });
 });

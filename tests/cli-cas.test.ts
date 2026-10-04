@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -293,6 +293,37 @@ describe("cli export/import versioning", () => {
     resetOut();
     expect(await runCli(["--db", db(), "import", badRevision, "--json"])).toBe(1);
     expect(stderr()).toContain("revision");
+  });
+
+  it("invalid import inputs fail before the store opens: no database or directory side effects", async () => {
+    const casesDir = join(dir, "inputs");
+    mkdirSync(casesDir);
+    const goodRecord = { id: 1, text: "x", tags: "", scope: "", pinned: false, createdAt: 1, updatedAt: 2, lastConfirmedAt: 1, revision: 1 };
+    const unreadable = join(casesDir, "unreadable.json");
+    writeFileSync(unreadable, JSON.stringify({ format: "dsh-ltm-export/2", records: [goodRecord] }));
+    chmodSync(unreadable, 0o000);
+    const badJson = join(casesDir, "bad.json");
+    writeFileSync(badJson, "{not json");
+    const badShape = join(casesDir, "bad-shape.json");
+    writeFileSync(badShape, JSON.stringify({
+      format: "dsh-ltm-export/2",
+      records: [{ ...goodRecord, revision: undefined }], // /2 requires revision
+    }));
+    for (const [name, file] of [
+      ["missing file", join(casesDir, "absent.json")],
+      ["unreadable file", unreadable],
+      ["invalid JSON", badJson],
+      ["invalid /2 shape", badShape],
+    ] as const) {
+      const targetDir = join(dir, `side-effect-${name.replace(/\W+/g, "-")}`);
+      const target = join(targetDir, "ltm.db");
+      resetOut();
+      expect(await runCli(["--db", target, "import", file, "--json"])).toBe(1);
+      expect(stderr().length).toBeGreaterThan(0);
+      // Validation happened before openStore: nothing was created at the target.
+      expect(existsSync(target)).toBe(false);
+      expect(existsSync(targetDir)).toBe(false);
+    }
   });
 
   it("rejects /2 exports missing a revision", async () => {

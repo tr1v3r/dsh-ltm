@@ -106,10 +106,21 @@ CLI `edit/tag/pin/confirm/forget/merge` 增 `--expected-revision`，merge 另有
 2. 备份：只读连接 `VACUUM INTO`（单一一致快照，含已提交 WAL；Node 22/24 通用，
    不用仅 24 的 serialize API）。默认名 `<db>.pre-v2-backup-<UTC时间戳>`；
    显式 `--backup` 必须是新文件，拒绝覆盖既有文件/数据库本体/sidecars/别名。
-3. 读写句柄 `BEGIN IMMEDIATE` 后重新核验版本与 v1 结构（不能只信无锁 preflight）；
-   并发已升级则报告 already-current。`ALTER TABLE memories ADD COLUMN revision …`
-   与 `meta.schema_version='2'` 同一事务提交；失败回滚列与版本戳、保留备份，
-   无半升级状态。不动 `fts_token_version`。
+3. 只读完整性预检（分类与锁内重验共用）：已存在的 `memories_fts` 必须是本包
+   约定的 FTS5 形状（text/tags/scope 三列、`unicode61` 分词器、自持内容、无
+   `content=` 外部内容模式）；缺失视为可重建，存在但畸形/外来一律拒绝。基础行
+   只读校验：id 正安全整数、text/tags/scope 为字符串、pinned∈{0,1}、生命周期
+   时间戳非负安全整数（v2 另加 revision 正安全整数）；错误只含元数据不含任何
+   存储原值，也不引入来源/审计列或跨列时间关系。畸形 FTS 或非法行（含仅存在于
+   已提交 WAL 帧中的）在 rw 句柄、备份与 ALTER 之前即被拒绝，main/WAL 字节
+   不变。current-v2 的普通打开 preflight 同样执行这两项检查。
+4. 读写句柄 `BEGIN IMMEDIATE` 后重新核验版本与 v1 结构（不能只信无锁 preflight）；
+   并发已升级的竞态分支同样核验完整 current 结构（不轻信版本戳），确认后报告
+   already-current 并**返回保留本次已建备份的路径与原因**（快照可能含私密正文，
+   保留并明示、绝不静默删除，操作者审阅后自行删除）。`ALTER TABLE memories ADD
+   COLUMN revision …` 与 `meta.schema_version='2'` 同一事务提交；失败回滚列与
+   版本戳、保留备份并在错误消息中给出备份路径，无半升级状态。不动
+   `fts_token_version`。
 4. 回滚方法（operator 手册）：先停掉所有写入者，再恢复备份快照；升级后发生的
    写入会随恢复丢失。旧二进制遇 v2 按「较新版本」fail-closed。
 
