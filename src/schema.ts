@@ -102,32 +102,224 @@ const SAFE_INTEGER_MAX = 9007199254740991;
  * Read-only shape check for an existing `memories_fts` object, shared by the
  * v1 classification, the under-lock re-verification, and the current-v2
  * preflight. A MISSING derived object is fine (idempotently rebuildable);
- * one that EXISTS must be the exact FTS5 layout this package writes: a real
- * fts5 virtual table over the three expected columns, the agreed
- * `unicode61` tokenizer, and self-owned content (no external-content or
- * contentless `content=` mode). Foreign or malformed objects are refused,
- * never silently rebuilt over.
+ * one that EXISTS must be the exact FTS5 layout this package writes.
+ *
+ * The check is a restricted lexer + strict whitelist over the package's known
+ * `CREATE VIRTUAL TABLE … USING fts5(…)` syntax — never whole-text regexes,
+ * which SQL comments or string literals can disguise. Line and block SQL
+ * comments are skipped as no-ops while strings and quoted identifiers are
+ * decoded with their escape rules, so neither can fake or hide a token.
+ * The accepted grammar is exactly:
+ *
+ *   CREATE VIRTUAL TABLE [IF NOT EXISTS] [db.]memories_fts USING fts5(
+ *     text, tags, scope, tokenize = 'unicode61' )
+ *
+ * with legal quoting forms ("x", [x], `x` for identifiers), free whitespace
+ * and comments, an optional trailing semicolon. Every column must be a
+ * plain indexable column (no `UNINDEXED` or any other modifier — an
+ * unindexed column would silently degrade full-text recall), and the option
+ * list must be exactly one `tokenize = 'unicode61'`: any other option
+ * (`content=`, `prefix=`, `content_rowid=`, tokenizer arguments, …) is a
+ * foreign or externally-owned layout and fails closed. This is not a general
+ * SQL parser and needs none.
  */
 export function assertFtsShape(db: DatabaseSync): void {
   const row = db
     .prepare("SELECT type, sql FROM sqlite_schema WHERE name = 'memories_fts'")
     .get() as { type: string; sql: string | null } | undefined;
   if (row === undefined) return;
-  const sql = (row.sql ?? "").replace(/\s+/g, " ").trim();
+  // Cross-check SQLite's own parse of the column list (cheap ground truth).
   const columns = db.prepare("PRAGMA table_info(memories_fts)").all() as unknown as TableColumn[];
   const names = columns.map((column) => column.name).join(",");
-  if (
-    row.type !== "table" ||
-    !/USING\s+fts5\s*\(/i.test(sql) ||
-    names !== "text,tags,scope" ||
-    !/tokenize\s*=\s*'unicode61'/i.test(sql) ||
-    // External-content/contentless FTS is a foreign derivation mode: our
-    // index stores the token stream itself and must stay rebuildable.
-    /\bcontent\s*=/i.test(sql)
-  ) {
+  let parsed = false;
+  try {
+    parsed = row.type === "table" && names === "text,tags,scope" &&
+      parsesAsKnownFts5Ddl(row.sql ?? "");
+  } catch {
+    parsed = false;
+  }
+  if (!parsed) {
     throw new Error(
-      "dsh-ltm: existing database has an unexpected memories_fts object (expected the fts5 text/tags/scope unicode61 self-content index); refusing to reuse or rebuild over it",
+      "dsh-ltm: existing database has an unexpected memories_fts object (expected exactly the fts5 text/tags/scope unicode61 self-content index); refusing to reuse or rebuild over it",
     );
+  }
+}
+
+/** One lexical token of the restricted FTS-DDL grammar. */
+type FtsDdlToken =
+  | { kind: "word"; value: string } // bare identifier/keyword, value lower-cased
+  | { kind: "quoted"; value: string } // decoded quoted identifier, value lower-cased
+  | { kind: "string"; value: string } // decoded string literal, value verbatim
+  | { kind: "punct"; value: string }; // ( ) , = . ;
+
+class FtsDdlSyntaxError extends Error {}
+
+/**
+ * Tokenize the DDL under the restricted grammar: whitespace and SQL comments
+ * (double-dash line, slash-star block) are skipped as no-ops; single-quoted strings
+ * (`''` escape), double-quoted / backtick / bracketed identifiers (doubled
+ * escapes inside) are decoded; anything else fails closed.
+ */
+function lexFtsDdl(sql: string): FtsDdlToken[] {
+  const tokens: FtsDdlToken[] = [];
+  let i = 0;
+  const fail = (): never => {
+    throw new FtsDdlSyntaxError("unexpected character");
+  };
+  while (i < sql.length) {
+    const ch = sql[i]!;
+    if (/\s/.test(ch)) {
+      i++;
+      continue;
+    }
+    if (ch === "-" && sql[i + 1] === "-") {
+      const end = sql.indexOf("\n", i);
+      i = end === -1 ? sql.length : end + 1;
+      continue;
+    }
+    if (ch === "/" && sql[i + 1] === "*") {
+      const end = sql.indexOf("*/", i + 2);
+      if (end === -1) fail();
+      i = end + 2;
+      continue;
+    }
+    if (ch === "'") {
+      let value = "";
+      i++;
+      for (;;) {
+        const close = sql.indexOf("'", i);
+        if (close === -1) fail();
+        if (sql[close + 1] === "'") {
+          value += sql.slice(i, close) + "'";
+          i = close + 2;
+          continue;
+        }
+        value += sql.slice(i, close);
+        i = close + 1;
+        break;
+      }
+      tokens.push({ kind: "string", value });
+      continue;
+    }
+    if (ch === '"' || ch === "`" || ch === "[") {
+      const closeCh = ch === "[" ? "]" : ch;
+      let value = "";
+      i++;
+      for (;;) {
+        const close = sql.indexOf(closeCh, i);
+        if (close === -1) fail();
+        if (closeCh !== "]" && sql[close + 1] === closeCh) {
+          value += sql.slice(i, close) + closeCh;
+          i = close + 2;
+          continue;
+        }
+        value += sql.slice(i, close);
+        i = close + 1;
+        break;
+      }
+      tokens.push({ kind: "quoted", value: value.toLowerCase() });
+      continue;
+    }
+    if (/[A-Za-z_]/.test(ch)) {
+      let end = i;
+      while (end < sql.length && /[A-Za-z0-9_$]/.test(sql[end]!)) end++;
+      tokens.push({ kind: "word", value: sql.slice(i, end).toLowerCase() });
+      i = end;
+      continue;
+    }
+    if ("(),=.;".includes(ch)) {
+      tokens.push({ kind: "punct", value: ch });
+      i++;
+      continue;
+    }
+    fail();
+  }
+  return tokens;
+}
+
+/**
+ * Parse the token stream against the strict whitelist grammar. Returns true
+ * only for the exact known layout; throws (or returns false) on any foreign
+ * token — comments cannot disguise tokens because they never become ones.
+ */
+function parsesAsKnownFts5Ddl(sql: string): boolean {
+  try {
+    const tokens = lexFtsDdl(sql);
+    let at = 0;
+    const next = (): FtsDdlToken => {
+      const token = tokens[at];
+      if (token === undefined) throw new FtsDdlSyntaxError("unexpected end");
+      at++;
+      return token;
+    };
+    const word = (expected: string): void => {
+      const token = next();
+      if (token.kind !== "word" || token.value !== expected) {
+        throw new FtsDdlSyntaxError(`expected ${expected}`);
+      }
+    };
+    const punct = (expected: string): void => {
+      const token = next();
+      if (token.kind !== "punct" || token.value !== expected) {
+        throw new FtsDdlSyntaxError(`expected ${expected}`);
+      }
+    };
+    // An identifier: bare word or any legal quoting form; string literals
+    // are NOT identifiers.
+    const ident = (): string => {
+      const token = next();
+      if (token.kind !== "word" && token.kind !== "quoted") {
+        throw new FtsDdlSyntaxError("expected identifier");
+      }
+      return token.value;
+    };
+
+    word("create");
+    word("virtual");
+    word("table");
+    if (tokens[at]?.kind === "word" && (tokens[at] as { value: string }).value === "if") {
+      word("if");
+      word("not");
+      word("exists");
+    }
+    // Optionally schema-qualified name; the LAST part is the object name.
+    let name = ident();
+    while (tokens[at]?.kind === "punct" && (tokens[at] as { value: string }).value === ".") {
+      punct(".");
+      name = ident();
+    }
+    if (name !== "memories_fts") throw new FtsDdlSyntaxError("wrong object name");
+    word("using");
+    if (ident() !== "fts5") throw new FtsDdlSyntaxError("wrong module");
+    punct("(");
+    for (const column of ["text", "tags", "scope"]) {
+      if (ident() !== column) throw new FtsDdlSyntaxError("wrong column");
+      // A plain indexable column: the next token must be the separator, so
+      // UNINDEXED (or any other modifier) fails closed here.
+      punct(",");
+    }
+    // Exactly one option: tokenize = 'unicode61' (no arguments). Every other
+    // option — content=, prefix=, columnsize=, tokenizer arguments, … — is
+    // outside the known layout and fails closed.
+    const option = next();
+    if (option.kind !== "word" || option.value !== "tokenize") {
+      throw new FtsDdlSyntaxError("unexpected option");
+    }
+    punct("=");
+    const tokenizer = next();
+    if (tokenizer.kind !== "string" || tokenizer.value.toLowerCase() !== "unicode61") {
+      throw new FtsDdlSyntaxError("wrong tokenizer");
+    }
+    punct(")");
+    // Optional trailing semicolon, then nothing but (already-skipped)
+    // whitespace/comments may remain.
+    if (tokens[at]?.kind === "punct" && (tokens[at] as { value: string }).value === ";") {
+      punct(";");
+    }
+    if (at !== tokens.length) throw new FtsDdlSyntaxError("trailing tokens");
+    return true;
+  } catch {
+    return false;
   }
 }
 

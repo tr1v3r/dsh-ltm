@@ -372,6 +372,13 @@ describe("preflight integrity: FTS shape and base rows (repair round 2)", () => 
     ["fts5 with a foreign tokenizer", "CREATE VIRTUAL TABLE memories_fts USING fts5(text, tags, scope, tokenize = 'porter')"],
     ["external-content fts5", "CREATE VIRTUAL TABLE memories_fts USING fts5(text, tags, scope, content='memories', content_rowid='id')"],
     ["fts5 with wrong columns", "CREATE VIRTUAL TABLE memories_fts USING fts5(text, tags)"],
+    ["unindexed text column", "CREATE VIRTUAL TABLE memories_fts USING fts5(text UNINDEXED, tags, scope, tokenize = 'unicode61')"],
+    ["unindexed scope column", "CREATE VIRTUAL TABLE memories_fts USING fts5(text, tags, scope unindexed, tokenize = 'unicode61')"],
+    ["detail layout option", "CREATE VIRTUAL TABLE memories_fts USING fts5(text, tags, scope, tokenize = 'unicode61', detail='none')"],
+    ["prefix layout option", "CREATE VIRTUAL TABLE memories_fts USING fts5(text, tags, scope, tokenize = 'unicode61', prefix='2')"],
+    ["tokenizer with arguments", "CREATE VIRTUAL TABLE memories_fts USING fts5(text, tags, scope, tokenize = 'unicode61 remove_diacritics 2')"],
+    ["option hidden behind a comment", "CREATE VIRTUAL TABLE memories_fts USING fts5(text, tags, scope /* sneaky */, tokenize = 'unicode61', prefix='2')"],
+    ["column typed with a string literal", "CREATE VIRTUAL TABLE memories_fts USING fts5('text', tags, scope, tokenize = 'unicode61')"],
   ];
 
   /**
@@ -450,6 +457,30 @@ describe("preflight integrity: FTS shape and base rows (repair round 2)", () => 
           .toEqual({ value: "1" });
         probe.close();
       }
+    },
+  );
+
+  const LEGAL_FTS: Array<[string, string]> = [
+    ["quoted identifiers", `CREATE VIRTUAL TABLE memories_fts USING fts5("text", [tags], \`scope\`, tokenize = 'unicode61')`],
+    ["comments and extra whitespace", "CREATE VIRTUAL TABLE memories_fts -- object comment\n USING fts5(\n  text, /* col */ tags, scope,\n  -- option comment\n  tokenize = 'unicode61' /* tail */\n)"],
+    ["schema-qualified name", "CREATE VIRTUAL TABLE main.memories_fts USING fts5(text, tags, scope, tokenize='unicode61')"],
+    ["option-like comment next to a clean layout", "CREATE VIRTUAL TABLE memories_fts USING fts5(text, tags, scope, -- content='memories'\n tokenize = 'unicode61')"],
+  ];
+
+  it.each(LEGAL_FTS.map(([label]) => label))(
+    "accepts the standard definition with %s and upgrades normally",
+    (label) => {
+      const [_, statement] = LEGAL_FTS.find(([l]) => l === label)!;
+      const path = v1With(statement, false, true);
+      const report = upgradeSchema(path);
+      expect(report.upgraded).toBe(true);
+      expect(report.recordCount).toBe(1);
+      // The variant FTS is accepted (a malformed one would have refused the
+      // upgrade); the store opens and reads the base rows through it.
+      const store = new MemoryStore(path);
+      cleanup.push(() => store.close());
+      expect(store.list()).toHaveLength(1);
+      expect(store.list()[0]!.revision).toBe(1);
     },
   );
 

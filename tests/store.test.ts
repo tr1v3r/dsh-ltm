@@ -424,8 +424,10 @@ describe("merge (R4/R6)", () => {
 
 describe("v2 preflight integrity (issue #32 repair round 2)", () => {
   /** A v2-stamped database whose revision column lacks the CHECK guard, so
-   * rows can be corrupted the way an external writer would leave them. */
-  function handcraftedV2(rowSql: string, inWal: boolean): string {
+   * rows can be corrupted the way an external writer would leave them.
+   * `extraSql` runs inside the WAL window; the benign default keeps the
+   * corruption-free shape used by the FTS-layout cases. */
+  function handcraftedV2(extraSql: string, inWal: boolean): string {
     const dir = mkdtempSync(join(tmpdir(), "dsh-ltm-v2rows-"));
     dirs.push(dir);
     const path = join(dir, "ltm.db");
@@ -447,7 +449,7 @@ describe("v2 preflight integrity (issue #32 repair round 2)", () => {
       db.exec(${JSON.stringify(base)});
       db.exec("PRAGMA journal_mode = WAL");
       db.exec("PRAGMA wal_autocheckpoint = 0");
-      db.exec(${JSON.stringify(rowSql)});
+      db.exec(${JSON.stringify(extraSql)});
       process.kill(process.pid, "SIGKILL");
     `;
     const child = spawnSync(process.execPath, ["-e", script, path], { stdio: ["ignore", "ignore", "pipe"] });
@@ -464,6 +466,40 @@ describe("v2 preflight integrity (issue #32 repair round 2)", () => {
     db.close();
     return path;
   }
+
+  it.each([
+    ["unindexed column in v2 fts", "CREATE VIRTUAL TABLE memories_fts USING fts5(text UNINDEXED, tags, scope, tokenize = 'unicode61')"],
+    ["foreign detail option in v2 fts", "CREATE VIRTUAL TABLE memories_fts USING fts5(text, tags, scope, tokenize = 'unicode61', detail='none')"],
+    ["comment-masked prefix option in v2 fts", "CREATE VIRTUAL TABLE memories_fts USING fts5(text, tags, scope, -- layout note\n tokenize = 'unicode61', prefix='2')"],
+  ])("refuses opening a v2 database with %s (main and WAL variants)", (_label, ftsSql) => {
+    for (const inWal of [false, true]) {
+      const path = handcraftedV2(ftsSql, inWal);
+      const mainBefore = sha256(path);
+      const walExisted = existsSync(path + "-wal");
+      const walBefore = walExisted ? sha256(path + "-wal") : undefined;
+      let message = "";
+      try {
+        const store = new MemoryStore(path);
+        stores.push(store);
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      expect(message).toMatch(/memories_fts/);
+      expect(sha256(path)).toBe(mainBefore);
+      if (walBefore !== undefined) expect(sha256(path + "-wal")).toBe(walBefore);
+    }
+  });
+
+  it("opens a v2 database whose fts uses legal quoting and comments", () => {
+    const path = handcraftedV2(
+      "CREATE VIRTUAL TABLE memories_fts -- object\n USING fts5(\"text\", [tags], scope, /* ok */ tokenize = 'unicode61')",
+      false,
+    );
+    const store = new MemoryStore(path);
+    stores.push(store);
+    expect(store.list()).toHaveLength(1);
+    expect(store.list()[0]!.revision).toBe(1);
+  });
 
   it.each([
     ["revision zero", "UPDATE memories SET revision = 0", true],
