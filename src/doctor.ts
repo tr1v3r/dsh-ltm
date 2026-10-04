@@ -1,7 +1,6 @@
 /** Read-only diagnostic surface: never construct MemoryStore or initialize FTS. */
 import { DatabaseSync } from "node:sqlite";
-import { statSync } from "node:fs";
-import { resolve } from "node:path";
+import { realpathSync, statSync } from "node:fs";
 import type { Config, MemoryRecord, TokenCounter } from "./contracts.js";
 import { assertSchemaCompatible } from "./schema.js";
 import { analyzeQuality } from "./quality.js";
@@ -23,8 +22,9 @@ function readRecord(row: Record<string, unknown>): MemoryRecord {
 
 export function doctor(config: Config, activeScope: string, tokenCounter?: TokenCounter, maxPairs = 100_000) {
   // Fail before opening missing paths; readOnly is also essential against races.
-  if (!statSync(config.path).isFile()) throw new Error("doctor: database must be an existing regular file");
-  const db = new DatabaseSync(config.path, { readOnly: true });
+  const databasePath = realpathSync.native(config.path);
+  if (!statSync(databasePath).isFile()) throw new Error("doctor: database must be an existing regular file");
+  const db = new DatabaseSync(databasePath, { readOnly: true });
   try {
     db.exec("BEGIN");
     try { assertSchemaCompatible(db); }
@@ -46,7 +46,7 @@ export function doctor(config: Config, activeScope: string, tokenCounter?: Token
     return {
       format: "dsh-ltm-doctor/1",
       readOnly: true,
-      databasePath: resolve(config.path),
+      databasePath,
       ftsCheck: "not inspected or repaired; analysis uses base rows only",
       analysisScope: "all database scopes",
       ...analyzeQuality(records, config, maxPairs),
