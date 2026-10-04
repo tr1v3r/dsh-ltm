@@ -95,6 +95,19 @@ function tableColumns(db: DatabaseSync, table: string): TableColumn[] | undefine
   return db.prepare(`PRAGMA table_info(${table})`).all() as unknown as TableColumn[];
 }
 
+/** Shared read-only metadata shape gate; SQLite permits TEXT PRIMARY KEY notnull=0. */
+export function assertMetaShape(db: DatabaseSync): void {
+  const columns = tableColumns(db, "meta");
+  const key = columns?.find((column) => column.name === "key");
+  const value = columns?.find((column) => column.name === "value");
+  if (columns?.length !== 2 || key?.type.toUpperCase() !== "TEXT" || key.pk !== 1 ||
+      value?.type.toUpperCase() !== "TEXT" || value.pk !== 0 || value.notnull !== 1) {
+    throw new Error(
+      "dsh-ltm: existing database has an unrecognized `meta` table; refusing to modify an unknown schema",
+    );
+  }
+}
+
 /** Upper bound shared by the safe-integer row checks (Number.MAX_SAFE_INTEGER). */
 const SAFE_INTEGER_MAX = 9007199254740991;
 
@@ -150,7 +163,8 @@ type FtsDdlToken =
   | { kind: "word"; value: string } // bare identifier/keyword, value lower-cased
   | { kind: "quoted"; value: string } // decoded quoted identifier, value lower-cased
   | { kind: "string"; value: string } // decoded string literal, value verbatim
-  | { kind: "punct"; value: string }; // ( ) , = . ;
+  | { kind: "number"; value: string }
+  | { kind: "punct"; value: string }; // delimiters and numeric constraint operators
 
 class FtsDdlSyntaxError extends Error {}
 
@@ -227,7 +241,16 @@ function lexFtsDdl(sql: string): FtsDdlToken[] {
       i = end;
       continue;
     }
-    if ("(),=.;".includes(ch)) {
+    // Numeric defaults/CHECK bounds in memories DDL. The FTS parser still
+    // rejects these tokens: its whitelist grammar is unchanged.
+    if (/[0-9]/.test(ch)) {
+      let end = i + 1;
+      while (end < sql.length && /[0-9]/.test(sql[end]!)) end++;
+      tokens.push({ kind: "number", value: sql.slice(i, end) });
+      i = end;
+      continue;
+    }
+    if ("(),=.;<>+-".includes(ch)) {
       tokens.push({ kind: "punct", value: ch });
       i++;
       continue;
@@ -355,6 +378,44 @@ export function assertMemoriesRowsHealthy(db: DatabaseSync, withRevision: boolea
 }
 
 /**
+ * PRAGMA cannot distinguish a reusable rowid from AUTOINCREMENT. Inspect only
+ * the actual id column declaration, at table-body depth, never text in a
+ * comment, default string, nested CHECK, or another table's sqlite_sequence.
+ * SQLite has already parsed the DDL; this is not a general SQL validator.
+ */
+function hasNonReusableMemoryId(db: DatabaseSync): boolean {
+  const row = db.prepare("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'memories'")
+    .get() as { sql: string | null } | undefined;
+  try {
+    const tokens = lexFtsDdl(row?.sql ?? "");
+    let depth = 0;
+    let column: FtsDdlToken[] = [];
+    const isId = (): boolean => column[0]?.value === "id" &&
+      (column[0].kind === "word" || column[0].kind === "quoted");
+    const matches = (): boolean => isId() && column.length === 5 &&
+      column.slice(1).every((token, index) =>
+        token.value === ["integer", "primary", "key", "autoincrement"][index] &&
+        (token.kind === "word" || (index === 0 && token.kind === "quoted")));
+    for (const token of tokens) {
+      if (token.kind === "punct" && token.value === "(") {
+        depth++;
+        if (depth === 1) continue;
+      }
+      if (token.kind === "punct" && (token.value === "," || token.value === ")") && depth === 1) {
+        if (isId()) return matches();
+        column = [];
+      } else if (depth >= 1) {
+        column.push(token);
+      }
+      if (token.kind === "punct" && token.value === ")") depth--;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Structural check of a `memories` base table against an expected column set.
  * `revision` additionally requires the v2 default `1` when `requireRevision`.
  * Unknown extra columns fail: a superset is not "a compatible v1/v2 table" —
@@ -367,7 +428,7 @@ function memoriesColumnsMatch(
   requireRevisionDefault: boolean,
 ): boolean {
   const columns = tableColumns(db, "memories");
-  if (columns === undefined) return false;
+  if (columns === undefined || !hasNonReusableMemoryId(db)) return false;
   if (columns.length !== expected.size) return false;
   for (const column of columns) {
     const want = expected.get(column.name);
@@ -422,15 +483,7 @@ export function assertSchemaCompatible(db: DatabaseSync): void {
 
   // A `meta`-named table from an unrelated schema must be refused with the
   // designed message instead of leaking `no such column: value`.
-  const columns = db.prepare("SELECT name FROM pragma_table_info('meta')").all() as {
-    name: string;
-  }[];
-  const columnNames = new Set(columns.map((column) => column.name));
-  if (!columnNames.has("key") || !columnNames.has("value")) {
-    throw new Error(
-      "dsh-ltm: existing database has an unrecognized `meta` table; refusing to modify an unknown schema",
-    );
-  }
+  assertMetaShape(db);
 
   const row = db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as
     | { value: unknown }
@@ -548,6 +601,7 @@ export function classifyForUpgrade(db: DatabaseSync): SchemaUpgradeClassificatio
  * between).
  */
 export function assertUpgradeableV1(db: DatabaseSync): void {
+  assertMetaShape(db);
   const row = db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as
     | { value: unknown }
     | undefined;

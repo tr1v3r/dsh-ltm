@@ -27,6 +27,7 @@ import { DatabaseSync } from "node:sqlite";
 
 import { outputConflictsWithDatabase } from "./output-path.js";
 import {
+  assertMetaShape,
   assertSchemaCompatible,
   assertUpgradeableV1,
   classifyForUpgrade,
@@ -137,17 +138,23 @@ export function upgradeSchema(path: string, options?: UpgradeSchemaOptions): Upg
   // One SQLite-consistent snapshot (committed WAL frames included) from a
   // read-only connection. Independent file copies of db/-wal/-shm would be
   // torn; `serialize()` is Node 24+ only while this package supports 22.19.
-  const snapshotter = new DatabaseSync(path, { readOnly: true });
+  let backupTaken = false;
+  let db: DatabaseSync | undefined;
+  let transactionStarted = false;
+  let failed = false;
   try {
-    snapshotter.prepare("VACUUM INTO ?").run(backup);
-  } finally {
-    snapshotter.close();
-  }
-
-  const db = new DatabaseSync(path, { timeout: 5000 });
-  try {
-    db.exec("BEGIN IMMEDIATE");
     try {
+      const snapshotter = new DatabaseSync(path, { readOnly: true });
+      try {
+        snapshotter.prepare("VACUUM INTO ?").run(backup);
+        backupTaken = true;
+      } finally {
+        snapshotter.close();
+      }
+      db = new DatabaseSync(path, { timeout: 5000 });
+      db.exec("BEGIN IMMEDIATE");
+      transactionStarted = true;
+      assertMetaShape(db);
       // Re-verify under the write lock: the unlocked preflight must not be
       // the only check. A concurrent upgrade that already committed leaves
       // the database current — verify the FULL current structure (never
@@ -158,6 +165,7 @@ export function upgradeSchema(path: string, options?: UpgradeSchemaOptions): Upg
       if (version?.value === String(SCHEMA_VERSION)) {
         assertSchemaCompatible(db);
         db.exec("ROLLBACK");
+        transactionStarted = false;
         // This run already wrote its backup before acquiring the lock. The
         // snapshot may contain private content, so it is kept and REPORTED
         // rather than silently deleted; the operator deletes it after review.
@@ -175,21 +183,31 @@ export function upgradeSchema(path: string, options?: UpgradeSchemaOptions): Upg
         String(SCHEMA_VERSION),
       );
       db.exec("COMMIT");
+      transactionStarted = false;
     } catch (error) {
-      try {
-        db.exec("ROLLBACK");
-      } catch {
-        // The transaction may already have been rolled back; the original
-        // error is the one that matters. The backup stays on disk.
+      failed = true;
+      if (transactionStarted) {
+        try {
+          db?.exec("ROLLBACK");
+        } catch {
+          // Preserve the original failure if SQLite already rolled back.
+        }
       }
-      // Never leave an unreported sensitive snapshot behind: surface where
-      // the kept backup is alongside the original failure.
-      throw new Error(
-        `${error instanceof Error ? error.message : String(error)}; backup kept at ${backup}`,
-      );
+      throw error;
+    } finally {
+      try {
+        db?.close();
+      } catch (error) {
+        if (!failed) throw error;
+      }
     }
-  } finally {
-    db.close();
+  } catch (error) {
+    // Includes open, lock acquisition, and close failures after the snapshot.
+    if (!backupTaken) throw error;
+    throw new Error(
+      `${error instanceof Error ? error.message : String(error)}; backup kept at ${backup}`,
+      { cause: error },
+    );
   }
 
   return { upgraded: true, schemaVersion: SCHEMA_VERSION, backupPath: backup, recordCount };

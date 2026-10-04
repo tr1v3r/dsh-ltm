@@ -7,7 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { SCHEMA_VERSION } from "../src/schema.js";
+import { assertUpgradeableV1, REVISION_COLUMN_DDL, SCHEMA_VERSION } from "../src/schema.js";
 import { joinTokens, tokenize } from "../src/tokenize.js";
 import { MemoryStore } from "../src/store.js";
 import { upgradeSchema } from "../src/upgrade.js";
@@ -143,6 +143,64 @@ function versionedMeta(value: string, extraSql = ""): string {
   db.close();
   return path;
 }
+
+describe("metadata and non-reusable identity preflight", () => {
+  const malformed: Array<[string, (ddl: string) => string]> = [
+    ["non-primary meta key", (ddl) => ddl.replace("key   TEXT PRIMARY KEY", "key TEXT")],
+    ["unique but non-primary meta key", (ddl) => ddl.replace("key   TEXT PRIMARY KEY", "key TEXT UNIQUE")],
+    ["wrong meta key type", (ddl) => ddl.replace("key   TEXT PRIMARY KEY", "key BLOB PRIMARY KEY")],
+    ["wrong meta value type", (ddl) => ddl.replace("value TEXT NOT NULL", "value BLOB NOT NULL")],
+    ["nullable meta value", (ddl) => ddl.replace("value TEXT NOT NULL", "value TEXT")],
+    ["composite meta primary key", (ddl) => ddl.replace("key   TEXT PRIMARY KEY", "key TEXT").replace("value TEXT NOT NULL", "value TEXT NOT NULL, PRIMARY KEY(key, value)")],
+    ["ambiguous duplicate versions", (ddl) => ddl.replace("key   TEXT PRIMARY KEY", "key TEXT") + "INSERT INTO meta VALUES ('schema_version', '99');"],
+    ["missing AUTOINCREMENT", (ddl) => ddl.replace("PRIMARY KEY AUTOINCREMENT", "PRIMARY KEY")],
+    ["comment-only AUTOINCREMENT", (ddl) => ddl.replace("PRIMARY KEY AUTOINCREMENT", "PRIMARY KEY /* AUTOINCREMENT */")],
+    ["string-only AUTOINCREMENT", (ddl) => ddl.replace("PRIMARY KEY AUTOINCREMENT", "PRIMARY KEY").replace("DEFAULT ''", "DEFAULT 'AUTOINCREMENT'")],
+    ["other table owns sqlite_sequence", (ddl) => ddl.replace("PRIMARY KEY AUTOINCREMENT", "PRIMARY KEY") + "CREATE TABLE other (id INTEGER PRIMARY KEY AUTOINCREMENT);"],
+    ["descending reusable primary key", (ddl) => ddl.replace("PRIMARY KEY AUTOINCREMENT", "PRIMARY KEY DESC")],
+  ];
+
+  it.each(malformed)("refuses %s in v1 and v2 without changing main/WAL", (_label, modify) => {
+    for (const [version, inWal] of [[1, false], [1, true], [2, false], [2, true]] as const) {
+      let ddl = modify(V1_DDL);
+      if (version === 2) ddl += `ALTER TABLE memories ADD COLUMN ${REVISION_COLUMN_DDL}; UPDATE meta SET value = '2' WHERE key = 'schema_version';`;
+      const path = inWal ? uncheckpointedDatabase("", ddl) : join(dir(), "main.db");
+      if (!inWal) {
+        const fixture = new DatabaseSync(path);
+        try { fixture.exec(ddl); } finally { fixture.close(); }
+      }
+      const hashes = (): string[] => [sha256(path), ...(inWal ? [sha256(path + "-wal")] : [])];
+      const before = hashes();
+      const backup = join(dir(), "refused.bak");
+      expect(() => upgradeSchema(path, { backupPath: backup })).toThrow(/meta|memories/);
+      expect(() => new MemoryStore(path)).toThrow(/meta|memories|older than supported/);
+      if (version === 1) {
+        const probe = new DatabaseSync(path, { readOnly: true });
+        try { expect(() => assertUpgradeableV1(probe)).toThrow(/meta|structure/); }
+        finally { probe.close(); }
+      }
+      expect(existsSync(backup)).toBe(false);
+      expect(hashes()).toEqual(before);
+    }
+  });
+
+  it.each(["id INTEGER PRIMARY KEY AUTOINCREMENT", '"id" "INTEGER" PRIMARY /* gap */ KEY -- gap\n AUTOINCREMENT', '[id] INTEGER PRIMARY KEY AUTOINCREMENT', '`id` INTEGER PRIMARY KEY AUTOINCREMENT'])(
+    "accepts %s and never reuses deleted identity", (idDdl) => {
+      const path = uncheckpointedDatabase("", V1_DDL.replace("id                INTEGER PRIMARY KEY AUTOINCREMENT", idDdl));
+      upgradeSchema(path);
+      const store = new MemoryStore(path);
+      try {
+        const first = store.write("first identity", []).record;
+        expect(store.forget(first.id)).toBe(true);
+        const second = store.write("second identity", []).record;
+        expect(second.id).toBeGreaterThan(first.id);
+        expect(second.revision).toBe(1);
+        expect(() => store.update(first.id, { text: "stale overwrite" }, undefined, { expectedRevision: first.revision! })).toThrow(/no such memory/);
+        expect(store.list().find((record) => record.id === second.id)?.text).toBe("second identity");
+      } finally { store.close(); }
+    },
+  );
+});
 
 describe("upgradeSchema classification and refusals", () => {
   it("never creates a missing database", () => {
@@ -297,6 +355,37 @@ describe("upgradeSchema v1 → v2", () => {
       .toEqual({ value: "2" });
     db.close();
   });
+
+  it("reports a readable private backup and preserves cause after a real lock timeout", () => {
+    const path = v1Database();
+    const backup = join(dir(), "locked.bak");
+    const writer = new DatabaseSync(path);
+    writer.exec("BEGIN IMMEDIATE");
+    const exec = vi.spyOn(DatabaseSync.prototype, "exec");
+    let failure: unknown;
+    let attemptedRollback = false;
+    try { upgradeSchema(path, { backupPath: backup }); }
+    catch (error) { failure = error; }
+    finally {
+      attemptedRollback = exec.mock.calls.some(([sql]) => sql === "ROLLBACK");
+      exec.mockRestore();
+      try { writer.exec("ROLLBACK"); } finally { writer.close(); }
+    }
+    // The upgrader never acquired a transaction, so must not roll it back.
+    expect(attemptedRollback).toBe(false);
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toContain("database is locked");
+    expect((failure as Error).message).toContain(`backup kept at ${backup}`);
+    expect((failure as Error).cause).toBeInstanceOf(Error);
+    expect(((failure as Error).cause as Error).message).toContain("database is locked");
+    const snapshot = new DatabaseSync(backup, { readOnly: true });
+    try {
+      expect(snapshot.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get()).toEqual({ value: "1" });
+      expect(snapshot.prepare("SELECT count(*) AS n FROM memories").get()).toEqual({ n: 2 });
+    } finally { snapshot.close(); }
+    // The failed upgrader closed its handle; a later normal upgrade succeeds.
+    expect(upgradeSchema(path).upgraded).toBe(true);
+  }, 15000);
 
   it("rolls back the column and version stamp when the ALTER or COMMIT fails, and keeps the backup", () => {
     for (const statement of ["ALTER TABLE memories ADD COLUMN", "COMMIT"]) {
