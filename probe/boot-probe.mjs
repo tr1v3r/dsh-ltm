@@ -99,9 +99,22 @@ check("write returns written=true", w1.written === true && w1id !== undefined, `
 check("write uses an automatic Git project scope",
   typeof w1.record?.scope === "string" && w1.record.scope.startsWith("git:") && !w1.record.scope.includes(root),
   `scope=${w1.record?.scope}`);
-const dup = await call("memory_write", { text: "Probe fact: the release branch is dev, squash merge convention applies." });
+const dupResult = await executeCall("memory_write", { text: "Probe fact: the release branch is dev, squash merge convention applies." });
+const dup = dupResult.value;
 check("near-duplicate blocked", dup.written === false && dup.dedupeHits?.length > 0,
   `${dup.dedupeHits?.length} hit(s) sim=${dup.dedupeHits?.[0]?.similarity}`);
+const dupText = dupResult.content.filter((block) => block.type === "text").map((block) => block.text).join("\n");
+check("native dedupe output renders every actionable hit", dup.dedupeHits.every((hit) =>
+  dupText.includes(`(#${hit.id}, rev ${hit.revision}, similarity ${hit.similarity}, measure ${hit.measure})`) &&
+  dupText.includes(hit.text) && dupText.includes(hit.scope) && dupText.includes(hit.tags)));
+const renderedHit = dupText.match(/\(#(\d+), rev (\d+),/);
+check("native dedupe output exposes id and revision", renderedHit !== null);
+if (renderedHit) {
+  const followUp = await call("memory_update", {
+    id: Number(renderedHit[1]), expectedRevision: Number(renderedHit[2]), tags: ["probe-reviewed"],
+  });
+  check("CAS update using only rendered dedupe identity succeeds", followUp.updated === true && followUp.revision === 2);
+}
 
 const w2 = await call("memory_write", { text: "数据库迁移时把 db+wal+shm 一起拷走再只读打开。", tags: ["probe", "migration"] });
 const w2id = w2.record?.id ?? w2.id;

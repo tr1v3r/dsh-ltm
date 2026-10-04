@@ -8,7 +8,7 @@
 
 import { defineTool, type ToolRunContext } from "@deepseek-ai/dsh-tools";
 import type { Context } from "@deepseek-ai/cordis";
-import { loadConfig } from "./config.js";
+import { escapeForPrompt, loadConfig } from "./config.js";
 import { MemoryStore } from "./store.js";
 import {
   createToolSet,
@@ -176,7 +176,13 @@ export function apply(ctx: Context, rawConfig: unknown) {
             text:
               value.written && value.record
                 ? `Stored memory #${value.record.id}${value.record.pinned ? " (pinned)" : ""}.${renderBudgetFeedback(value)}`
-                : `Not stored — ${value.dedupeHits.length} near-duplicate(s) found. ${value.hint ?? "Review existing facts before retrying."}`,
+                : [
+                    `Not stored — ${value.dedupeHits.length} near-duplicate(s) found. ${value.hint ?? "Review existing facts before retrying."}`,
+                    ...value.dedupeHits.map((hit) => escapeForPrompt(
+                      `- (#${hit.id}, rev ${hit.revision}, similarity ${hit.similarity}, measure ${hit.measure}) [${hit.tags}] {${hit.scope}} ${hit.text}`,
+                      config.escapeSequences,
+                    )),
+                  ].join("\n"),
           },
         ],
       },
