@@ -9,7 +9,7 @@ Structured long-term memory for [DeepSeek Harness](https://github.com/deepseek-a
 
 ## Install into a profile
 
-The DSH peer requirements include the verified `0.2.1-rc.2` runtime alongside the existing pre-`0.2.0` range. Other `0.2.x` prereleases require separate compatibility validation.
+The DSH peer requirements include the verified `0.2.1-rc.1` desktop and `0.2.1-rc.2` CLI runtimes alongside the existing pre-`0.2.0` range. Other `0.2.x` prereleases require separate compatibility validation.
 
 With `@tr1v3r/dsh-ltm` **0.1.2 or newer**, install and register the bundled configuration in one command:
 
