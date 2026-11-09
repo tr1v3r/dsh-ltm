@@ -16,12 +16,12 @@
 //
 // Usage: node probe/boot-probe.mjs [db-path]   (default probe/tmp/ltm.db)
 
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import process from "node:process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const DSH = process.env.DSH_NODE_MODULES ?? path.join(
   execFileSync("npm", ["root", "-g"], { encoding: "utf8" }).trim(),
@@ -30,6 +30,11 @@ const DSH = process.env.DSH_NODE_MODULES ?? path.join(
 const { boot } = await import(`${DSH}/@deepseek-ai/dsh-app-boot/lib/index.js`);
 const { provideCmdline } = await import(`${DSH}/@deepseek-ai/dsh-cmdline/lib/index.js`);
 const { createLaunchEnvironmentSnapshot } = await import(`${DSH}/@deepseek-ai/dsh-launch-environment/lib/index.js`);
+
+// DSH 0.2.2 delegates batches to a separately mounted executor. Older hosts
+// expose single-call execution directly on the registry.
+const executorPath = `${DSH}/@deepseek-ai/dsh-tool-executor-native/lib/index.js`;
+const nativeExecutor = existsSync(executorPath) ? await import(executorPath) : undefined;
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const dbArg = process.argv[2] ?? path.join(root, "probe/tmp/ltm.db");
@@ -43,12 +48,13 @@ process.stdout.isTTY = true;
 const configPath = path.join(root, "probe/cordis.yml");
 
 const ctx = await boot("ltm-probe", configPath, [], (host) => {
+  if (nativeExecutor !== undefined) host.plugin(nativeExecutor);
   provideCmdline(host, { args: [], exit: (code = 0) => process.exit(code) });
   host.provide(
     "launchEnvironment",
     createLaunchEnvironmentSnapshot([{ source: "process", values: process.env }]),
   );
-});
+}, pathToFileURL(path.join(DSH, "probe.mjs")).href);
 
 const failures = [];
 function check(label, ok, detail = "") {
@@ -70,13 +76,21 @@ const otherAgent = {
 
 let nextCallId = 1;
 async function executeCall(name, args, agent = probeAgent) {
-  const result = await ctx.tools.execute({
-    callId: `boot-probe-${nextCallId++}`,
+  const callId = `boot-probe-${nextCallId++}`;
+  const input = {
+    callId,
     name,
     arguments: args,
     agent,
     signal: new AbortController().signal,
-  });
+  };
+  const result = nativeExecutor === undefined
+    ? await ctx.tools.execute(input)
+    : (await ctx.tools.execute({
+      calls: [{ type: "tool-call", id: callId, name, arguments: JSON.stringify(args) }],
+      agent,
+      signal: input.signal,
+    })).results[0].result;
   if (result.isError) {
     throw new Error(`${name} failed via registry: ${result.error.code}: ${result.error.message}`);
   }
